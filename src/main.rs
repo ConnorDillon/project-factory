@@ -11,6 +11,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, Cursor, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::{env, thread};
 use tar::{Archive, Entry};
 
@@ -203,47 +204,66 @@ fn run_process<T: Read, U: Write + Send + 'static>(
             io::copy(&mut input, &mut input_file)?;
             File::create(&o)?;
             let mut child = proc.command.spawn()?;
-            child.wait()?;
-            let mut output_file = File::open(&o)?;
-            io::copy(&mut output_file, &mut output)?;
-            fs::remove_file(i)?;
-            fs::remove_file(o)?;
+            spawn(move || {
+                child.wait()?;
+                let mut output_file = File::open(&o)?;
+                io::copy(&mut output_file, &mut output)?;
+                fs::remove_file(i)?;
+                fs::remove_file(o)
+            });
         }
         (Some(i), None) => {
             let mut input_file = File::create(&i)?;
             io::copy(&mut input, &mut input_file)?;
             let mut child = proc.command.spawn()?;
-            let mut stdout = child.stdout.take().unwrap();
-            io::copy(&mut stdout, &mut output)?;
-            child.wait()?;
-            fs::remove_file(i)?;
+            spawn(move || {
+                let mut stdout = child.stdout.take().unwrap();
+                io::copy(&mut stdout, &mut output)?;
+                child.wait()?;
+                fs::remove_file(i)
+            });
         }
         (None, Some(o)) => {
             File::create(&o)?;
             let mut child = proc.command.spawn()?;
             let mut stdin = child.stdin.take().unwrap();
             io::copy(&mut input, &mut stdin)?;
-            child.wait()?;
-            let mut output_file = File::open(&o)?;
-            io::copy(&mut output_file, &mut output)?;
-            fs::remove_file(o)?;
+            spawn(move || {
+                child.wait()?;
+                let mut output_file = File::open(&o)?;
+                io::copy(&mut output_file, &mut output)?;
+                fs::remove_file(o)
+            });
         }
         (None, None) => {
             let mut child = proc.command.spawn()?;
             let mut stdout = child.stdout.take().unwrap();
-            let th = thread::spawn(move || io::copy(&mut stdout, &mut output).unwrap());
+            spawn(move || io::copy(&mut stdout, &mut output));
             let mut stdin = child.stdin.take().unwrap();
             io::copy(&mut input, &mut stdin)?;
-            child.wait()?;
-            th.join().unwrap();
         }
     }
     Ok(())
 }
 
+fn spawn<F, T>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> io::Result<T>,
+    F: Send + 'static,
+    T: Send + 'static,
+{
+    thread::spawn(move || match f() {
+        Ok(x) => x,
+        Err(x) => {
+            error!("{:?}", x);
+            panic!("{:?}", x)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::time::Duration;
 
     use super::*;
 
@@ -293,6 +313,7 @@ mod tests {
         let input_file_name = proc.input_file_name.clone().unwrap();
         let input = Cursor::new(b"echo $INPUT");
         run_process(proc, input, File::create("test_run_process").unwrap()).unwrap();
+        thread::sleep(Duration::from_millis(100));
         let mut output = File::open("test_run_process").unwrap();
         let mut result = [0u8; 16];
         output.read_exact(&mut result).unwrap();
@@ -317,6 +338,7 @@ mod tests {
         ))];
         let open_output = |_| File::create("test_process_files");
         process_files(&config, files.into_iter(), open_output).unwrap();
+        thread::sleep(Duration::from_millis(100));
         let mut output = File::open("test_process_files").unwrap();
         let mut result = [0u8; 6];
         output.read_exact(&mut result).unwrap();
