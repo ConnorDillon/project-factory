@@ -2,19 +2,18 @@
 
 use getopts::Options;
 use log::{debug, error, info, trace, warn, Level};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_yaml::from_reader;
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::HashMap;
+use std::env;
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::{env, thread};
 use tar::{Archive, Entry};
+use threadpool::ThreadPool;
 
 fn main() {
     env_logger::init();
@@ -68,7 +67,7 @@ fn process_files<
     iter: T,
     output: V,
 ) -> io::Result<()> {
-    let tc = ThreadCount::new();
+    let tp = ThreadPool::new(num_cpus::get() * 4);
     let mut gen = Gen::new();
     let mut buf = Vec::with_capacity(1024);
     for entry_result in iter {
@@ -82,14 +81,14 @@ fn process_files<
                     let cur = Cursor::new(&mut buf);
                     let proc = prep_process(&mut gen, p);
                     info!("Processing {} (type: {}) with {}", name, f, p.name);
-                    run_process(&tc, proc, cur.chain(entry), output(f)?)?;
+                    run_process(&tp, proc, cur.chain(entry), output(f)?)?;
                 }
                 None => error!("File type not included in config: {}", f),
             },
             None => warn!("File type not determined for {}", name),
         }
     }
-    tc.wait();
+    tp.join();
     Ok(())
 }
 
@@ -106,36 +105,13 @@ struct Plugin {
     stdout: Option<bool>,
 }
 
-#[derive(Clone)]
-struct ThreadCount(Arc<(Mutex<u32>, Condvar)>);
-
-impl ThreadCount {
-    fn new() -> ThreadCount {
-        ThreadCount(Arc::new((Mutex::new(0u32), Condvar::new())))
-    }
-
-    fn wait(&self) {
-        let (lock, cvar) = &*self.0;
-        let _guard = cvar.wait_while(lock.lock().unwrap(), |c| *c > 0).unwrap();
-    }
-
-    fn incr(&self) {
-        let mut count = self.0 .0.lock().unwrap();
-        *count = *count + 1;
-    }
-
-    fn decr(&self) {
-        let mut count = self.0 .0.lock().unwrap();
-        *count = *count - 1;
-        self.0 .1.notify_all();
-    }
-}
-
 fn get_file_type(_name: &str, head: &[u8]) -> Option<FileType> {
     if head.len() >= 4 && &head[..4] == b"FILE" {
         Some("ntfs.mft".into())
     } else if head.len() >= 9 && &head[..9] == b"#!/bin/sh" {
         Some("script.sh".into())
+    } else if head.len() >= 4 && &head[..4] == &[0x4d, 0x41, 0x4d, 0x04] {
+        Some("windows.prefetch".into())
     } else {
         None
     }
@@ -237,7 +213,7 @@ fn replace_arg(args: &mut Vec<String>, var: &str, rep: &str) {
 }
 
 fn run_process<T: Read, U: Write + Send + 'static>(
-    tc: &ThreadCount,
+    tp: &ThreadPool,
     mut proc: PreppedProcess,
     mut input: T,
     output: U,
@@ -247,9 +223,9 @@ fn run_process<T: Read, U: Write + Send + 'static>(
         (Some(i), Some(o)) => {
             io::copy(&mut input, &mut File::create(&i)?)?;
             let mut child = proc.command.spawn()?;
-            spawn_logger(tc, Level::Info, child.stdout.take(), plugin_name.clone());
-            spawn_logger(tc, Level::Error, child.stderr.take(), plugin_name.clone());
-            spawn(tc.clone(), move || {
+            spawn_logger(tp, Level::Info, child.stdout.take(), plugin_name.clone());
+            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
+            spawn(tp, move || {
                 child.wait()?;
                 let output_file = File::open(&o)?;
                 copy_output(plugin_name, output_file, output)?;
@@ -260,8 +236,8 @@ fn run_process<T: Read, U: Write + Send + 'static>(
         (Some(i), None) => {
             io::copy(&mut input, &mut File::create(&i)?)?;
             let mut child = proc.command.spawn()?;
-            spawn_logger(tc, Level::Error, child.stderr.take(), plugin_name.clone());
-            spawn(tc.clone(), move || {
+            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
+            spawn(tp, move || {
                 let stdout = child.stdout.take().unwrap();
                 copy_output(plugin_name, stdout, output)?;
                 child.wait()?;
@@ -272,10 +248,10 @@ fn run_process<T: Read, U: Write + Send + 'static>(
             File::create(&o)?;
             let mut child = proc.command.spawn()?;
             let mut stdin = child.stdin.take().unwrap();
-            spawn_logger(tc, Level::Info, child.stdout.take(), plugin_name.clone());
-            spawn_logger(tc, Level::Error, child.stderr.take(), plugin_name.clone());
+            spawn_logger(tp, Level::Info, child.stdout.take(), plugin_name.clone());
+            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
             io::copy(&mut input, &mut stdin)?;
-            spawn(tc.clone(), move || {
+            spawn(tp, move || {
                 child.wait()?;
                 let output_file = File::open(&o)?;
                 copy_output(plugin_name, output_file, output)?;
@@ -284,9 +260,9 @@ fn run_process<T: Read, U: Write + Send + 'static>(
         }
         (None, None) => {
             let mut child = proc.command.spawn()?;
-            spawn_logger(tc, Level::Error, child.stderr.take(), plugin_name.clone());
+            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
             let stdout = child.stdout.take().unwrap();
-            spawn(tc.clone(), move || copy_output(plugin_name, stdout, output));
+            spawn(tp, move || copy_output(plugin_name, stdout, output));
             let mut stdin = child.stdin.take().unwrap();
             io::copy(&mut input, &mut stdin)?;
         }
@@ -294,17 +270,12 @@ fn run_process<T: Read, U: Write + Send + 'static>(
     Ok(())
 }
 
-fn spawn_logger<T>(
-    tc: &ThreadCount,
-    level: Level,
-    rdr: Option<T>,
-    plugin_name: String,
-) -> JoinHandle<()>
+fn spawn_logger<T>(tp: &ThreadPool, level: Level, rdr: Option<T>, plugin_name: String)
 where
     T: Read + Send + 'static,
 {
     let mut bufrdr = BufReader::new(rdr.unwrap());
-    spawn(tc.clone(), move || {
+    spawn(tp, move || {
         let mut buf = String::new();
         while bufrdr.read_line(&mut buf)? > 0 {
             match level {
@@ -320,23 +291,16 @@ where
     })
 }
 
-fn spawn<F, T>(tc: ThreadCount, f: F) -> JoinHandle<T>
+fn spawn<F, T>(tp: &ThreadPool, f: F)
 where
     F: FnOnce() -> io::Result<T>,
     F: Send + 'static,
     T: Send + 'static,
 {
-    tc.incr();
-    thread::spawn(move || match f() {
-        Ok(x) => {
-            tc.decr();
-            x
-        }
+    tp.execute(|| match f() {
+        Ok(_) => {}
         Err(x) => {
             error!("{:?}", x);
-            tc.decr();
-            drop(tc);
-            Err(x).unwrap()
         }
     })
 }
@@ -367,16 +331,8 @@ fn copy_output<T: Read, U: Write>(
     Ok(())
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
-struct Line {
-    plugin: String,
-    output: String,
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     #[test]
@@ -414,7 +370,7 @@ mod tests {
     #[test]
     fn test_run_process() {
         //env_logger::builder().is_test(true).try_init().unwrap();
-        let tc = ThreadCount::new();
+        let tp = ThreadPool::new(1);
         let mut gen = Gen::new();
         let plugin = Plugin {
             name: "foo".into(),
@@ -429,8 +385,8 @@ mod tests {
         expected.extend_from_slice(&proc.input_file_name.as_ref().unwrap().as_bytes());
         expected.push(NEWLINE);
         let input = Cursor::new(b"echo $INPUT");
-        run_process(&tc, proc, input, File::create("test_run_process").unwrap()).unwrap();
-        tc.wait();
+        run_process(&tp, proc, input, File::create("test_run_process").unwrap()).unwrap();
+        tp.join();
         let mut output = File::open("test_run_process").unwrap();
         let mut result = Vec::new();
         output.read_to_end(&mut result).unwrap();
@@ -455,7 +411,6 @@ mod tests {
         ))];
         let open_output = |_| File::create("test_process_files");
         process_files(&config, files.into_iter(), open_output).unwrap();
-        thread::sleep(Duration::from_millis(100));
         let mut output = File::open("test_process_files").unwrap();
         let mut result = Vec::new();
         output.read_to_end(&mut result).unwrap();
