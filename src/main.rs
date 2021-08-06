@@ -103,8 +103,22 @@ struct Plugin {
     name: String,
     path: PathBuf,
     args: Option<Vec<String>>,
-    stdin: Option<bool>,
-    stdout: Option<bool>,
+    input: Option<InputType>,
+    output: Option<OutputType>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(non_camel_case_types)]
+enum InputType {
+    file,
+    stdin,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(non_camel_case_types)]
+enum OutputType {
+    file,
+    stdout,
 }
 
 #[derive(Clone)]
@@ -167,33 +181,37 @@ fn prep_process(gen: &mut Gen, plugin: &Plugin) -> PreppedProcess {
     let mut cmd = Command::new(&plugin.path);
     let mut args = plugin.args.clone().unwrap_or(Vec::new());
     let cwd = env::current_dir().unwrap();
-    let input_file_name = if plugin.stdin.unwrap_or(false) {
-        cmd.stdin(Stdio::piped());
-        None
-    } else {
-        cmd.stdin(Stdio::null());
-        let mut input_path = cwd.clone();
-        input_path.push(gen.gen_string());
-        let input_path_str = String::from(input_path.to_str().unwrap());
-        cmd.env("INPUT", &input_path);
-        replace_arg(&mut args, "$INPUT", &input_path_str);
-        Some(input_path_str)
+    let input_file_name = match plugin.input.as_ref().unwrap_or(&InputType::file) {
+        InputType::stdin => {
+            cmd.stdin(Stdio::piped());
+            None
+        }
+        InputType::file => {
+            cmd.stdin(Stdio::null());
+            let mut input_path = cwd.clone();
+            input_path.push(gen.gen_string());
+            let input_path_str = String::from(input_path.to_str().unwrap());
+            cmd.env("INPUT", &input_path);
+            replace_arg(&mut args, "$INPUT", &input_path_str);
+            Some(input_path_str)
+        }
     };
-    let output_file_name = if plugin.stdout.unwrap_or(false) {
-        None
-    } else {
-        let mut output_cwd = cwd.clone();
-        let output_dir = String::from(output_cwd.to_str().unwrap());
-        replace_arg(&mut args, "$OUTPUT_DIR", &output_dir);
-        cmd.env("OUTPUT_DIR", &output_dir);
-        let output_file = gen.gen_string();
-        replace_arg(&mut args, "$OUTPUT_FILE", &output_file);
-        cmd.env("OUTPUT_FILE", &output_file);
-        output_cwd.push(output_file);
-        let output = String::from(output_cwd.to_str().unwrap());
-        cmd.env("OUTPUT", &output);
-        replace_arg(&mut args, "$OUTPUT", &output);
-        Some(output)
+    let output_file_name = match plugin.output.as_ref().unwrap_or(&OutputType::file) {
+        OutputType::stdout => None,
+        OutputType::file => {
+            let mut output_cwd = cwd.clone();
+            let output_dir = String::from(output_cwd.to_str().unwrap());
+            replace_arg(&mut args, "$OUTPUT_DIR", &output_dir);
+            cmd.env("OUTPUT_DIR", &output_dir);
+            let output_file = gen.gen_string();
+            replace_arg(&mut args, "$OUTPUT_FILE", &output_file);
+            cmd.env("OUTPUT_FILE", &output_file);
+            output_cwd.push(output_file);
+            let output = String::from(output_cwd.to_str().unwrap());
+            cmd.env("OUTPUT", &output);
+            replace_arg(&mut args, "$OUTPUT", &output);
+            Some(output)
+        }
     };
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     PreppedProcess {
@@ -400,8 +418,8 @@ mod tests {
             name: "foo".into(),
             path: "bar".into(),
             args: Some(vec!["--baz".into(), "$INPUT".into()]),
-            stdin: None,
-            stdout: Some(true),
+            input: None,
+            output: Some(OutputType::stdout),
         };
         let proc = prep_process(&mut gen, &plugin);
         assert_eq!(
@@ -425,8 +443,8 @@ mod tests {
             name: "foo".into(),
             path: "/bin/sh".into(),
             args: Some(vec!["$INPUT".into()]),
-            stdin: None,
-            stdout: Some(true),
+            input: Some(InputType::file),
+            output: Some(OutputType::stdout),
         };
         let proc = prep_process(&mut gen, &plugin);
         let mut expected = Vec::new();
@@ -456,8 +474,8 @@ mod tests {
             name: "foo".into(),
             path: "/bin/sh".into(),
             args: Some(vec!["$INPUT".into()]),
-            stdin: None,
-            stdout: Some(true),
+            input: None,
+            output: Some(OutputType::stdout),
         };
         let mut config = HashMap::new();
         config.insert(String::from("script.sh"), plugin);
