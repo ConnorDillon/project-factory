@@ -133,6 +133,11 @@ impl ProcessCount {
     }
 }
 
+static LNK_HEADER: [u8; 20] = [
+    0x4c, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x46,
+];
+
 fn get_file_type(_name: &str, head: &[u8]) -> Option<FileType> {
     if head.len() >= 4 && &head[..4] == b"FILE" {
         Some("ntfs.mft".into())
@@ -140,6 +145,8 @@ fn get_file_type(_name: &str, head: &[u8]) -> Option<FileType> {
         Some("script.sh".into())
     } else if head.len() >= 4 && &head[..4] == &[0x4d, 0x41, 0x4d, 0x04] {
         Some("windows.prefetch".into())
+    } else if head.len() >= 20 && &head[..20] == &LNK_HEADER {
+        Some("windows.lnk".into())
     } else {
         None
     }
