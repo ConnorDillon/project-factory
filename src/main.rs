@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use tar::{Archive, Entry};
 use threadpool::ThreadPool;
@@ -107,17 +107,18 @@ struct Plugin {
     output: Option<OutputType>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
 #[allow(non_camel_case_types)]
 enum InputType {
     file,
     stdin,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
 #[allow(non_camel_case_types)]
 enum OutputType {
     file,
+    dir,
     stdout,
 }
 
@@ -180,52 +181,54 @@ impl<T: Read> Name for Entry<'_, T> {
 fn prep_process(gen: &mut Gen, plugin: &Plugin) -> PreppedProcess {
     let mut cmd = Command::new(&plugin.path);
     let mut args = plugin.args.clone().unwrap_or(Vec::new());
-    let cwd = env::current_dir().unwrap();
-    let input_file_name = match plugin.input.as_ref().unwrap_or(&InputType::file) {
+    let input_type = plugin.input.unwrap_or(InputType::file);
+    let output_type = plugin.output.unwrap_or(OutputType::file);
+    let input_file_name = match input_type {
         InputType::stdin => {
             cmd.stdin(Stdio::piped());
             None
         }
         InputType::file => {
             cmd.stdin(Stdio::null());
-            let mut input_path = cwd.clone();
-            input_path.push(gen.gen_string());
-            let input_path_str = String::from(input_path.to_str().unwrap());
-            cmd.env("INPUT", &input_path);
-            replace_arg(&mut args, "$INPUT", &input_path_str);
-            Some(input_path_str)
+            let path = gen_io_path(gen).unwrap();
+            cmd.env("INPUT", &path);
+            replace_arg(&mut args, "$INPUT", &path);
+            Some(path)
         }
     };
-    let output_file_name = match plugin.output.as_ref().unwrap_or(&OutputType::file) {
+    let output_file_name = match output_type {
         OutputType::stdout => None,
-        OutputType::file => {
-            let mut output_cwd = cwd.clone();
-            let output_dir = String::from(output_cwd.to_str().unwrap());
-            replace_arg(&mut args, "$OUTPUT_DIR", &output_dir);
-            cmd.env("OUTPUT_DIR", &output_dir);
-            let output_file = gen.gen_string();
-            replace_arg(&mut args, "$OUTPUT_FILE", &output_file);
-            cmd.env("OUTPUT_FILE", &output_file);
-            output_cwd.push(output_file);
-            let output = String::from(output_cwd.to_str().unwrap());
-            cmd.env("OUTPUT", &output);
-            replace_arg(&mut args, "$OUTPUT", &output);
-            Some(output)
-        }
+        OutputType::dir => Some(gen_io_path(gen).unwrap()),
+        OutputType::file => Some(gen_io_path(gen).unwrap()),
     };
+    if let Some(path) = &output_file_name {
+        cmd.env("OUTPUT", path);
+        replace_arg(&mut args, "$OUTPUT", path);
+    }
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     PreppedProcess {
         command: cmd,
         input_file_name,
         output_file_name,
+        input_type,
+        output_type,
         plugin_name: plugin.name.clone(),
     }
+}
+
+fn gen_io_path(gen: &mut Gen) -> io::Result<String> {
+    let mut path = env::current_dir()?;
+    let name = gen.gen_string();
+    path.push(name);
+    Ok(path.to_str().unwrap().into())
 }
 
 struct PreppedProcess {
     command: Command,
     input_file_name: Option<String>,
     output_file_name: Option<String>,
+    input_type: InputType,
+    output_type: OutputType,
     plugin_name: String,
 }
 
@@ -272,66 +275,75 @@ fn run_process<T: Read, U: Write + Send + 'static>(
     mut input: T,
     output: U,
 ) -> io::Result<()> {
-    let plugin_name = proc.plugin_name;
-    match (proc.input_file_name, proc.output_file_name) {
-        (Some(i), Some(o)) => {
-            io::copy(&mut input, &mut File::create(&i)?)?;
+    if proc.output_type == OutputType::dir {
+        fs::create_dir(proc.output_file_name.as_ref().unwrap())?;
+    }
+    match proc.input_type {
+        InputType::file => {
+            let input_path = proc.input_file_name.as_ref().unwrap();
+            io::copy(&mut input, &mut File::create(&input_path)?)?;
             pc.incr();
-            let mut child = proc.command.spawn()?;
-            spawn_logger(tp, Level::Info, child.stdout.take(), plugin_name.clone());
-            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
-            spawn(tp, move || {
-                child.wait()?;
-                pc.decr();
-                let output_file = File::open(&o)?;
-                copy_output(plugin_name, output_file, output)?;
-                fs::remove_file(i)?;
-                fs::remove_file(o)
-            });
+            let child = proc.command.spawn()?;
+            spawn_output_handlers(tp, pc, proc, output, child);
         }
-        (Some(i), None) => {
-            io::copy(&mut input, &mut File::create(&i)?)?;
-            pc.incr();
-            let mut child = proc.command.spawn()?;
-            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
-            spawn(tp, move || {
-                let stdout = child.stdout.take().unwrap();
-                copy_output(plugin_name, stdout, output)?;
-                child.wait()?;
-                pc.decr();
-                fs::remove_file(i)
-            });
-        }
-        (None, Some(o)) => {
-            File::create(&o)?;
+        InputType::stdin => {
             pc.incr();
             let mut child = proc.command.spawn()?;
             let mut stdin = child.stdin.take().unwrap();
-            spawn_logger(tp, Level::Info, child.stdout.take(), plugin_name.clone());
-            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
-            io::copy(&mut input, &mut stdin)?;
-            spawn(tp, move || {
-                child.wait()?;
-                pc.decr();
-                let output_file = File::open(&o)?;
-                copy_output(plugin_name, output_file, output)?;
-                fs::remove_file(o)
-            });
-        }
-        (None, None) => {
-            pc.incr();
-            let mut child = proc.command.spawn()?;
-            spawn_logger(tp, Level::Error, child.stderr.take(), plugin_name.clone());
-            let stdout = child.stdout.take().unwrap();
-            let mut stdin = child.stdin.take().unwrap();
-            spawn(tp, move || {
-                copy_output(plugin_name, stdout, output)?;
-                child.wait()?;
-                pc.decr();
-                Ok(())
-            });
+            spawn_output_handlers(tp, pc, proc, output, child);
             io::copy(&mut input, &mut stdin)?;
         }
+    };
+    Ok(())
+}
+
+fn spawn_output_handlers<U: Write + Send + 'static>(
+    tp: &ThreadPool,
+    pc: ProcessCount,
+    proc: PreppedProcess,
+    mut output: U,
+    mut child: Child,
+) {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    spawn_logger(tp, Level::Error, stderr, proc.plugin_name.clone());
+    match proc.output_type {
+        OutputType::file => {
+            spawn_logger(tp, Level::Info, stdout, proc.plugin_name.clone());
+            spawn(tp, move || {
+	        wait_and_cleanup(&pc, &mut child, &proc)?;
+                let output_path = proc.output_file_name.unwrap();
+                let output_file = File::open(&output_path)?;
+                copy_output(&proc.plugin_name, output_file, &mut output)?;
+                fs::remove_file(&output_path)
+            });
+        }
+        OutputType::dir => {
+            spawn_logger(tp, Level::Info, stdout, proc.plugin_name.clone());
+            spawn(tp, move || {
+	        wait_and_cleanup(&pc, &mut child, &proc)?;
+                let output_path = proc.output_file_name.as_ref().unwrap();
+                for entry in fs::read_dir(&output_path)? {
+		    let file_path = entry?.path();
+                    let output_file = File::open(&file_path)?;
+                    copy_output(&proc.plugin_name, output_file, &mut output)?;
+		    fs::remove_file(file_path)?;
+                }
+                fs::remove_dir(&output_path)
+            });
+        }
+        OutputType::stdout => spawn(tp, move || {
+            copy_output(&proc.plugin_name, stdout.unwrap(), &mut output)?;
+	    wait_and_cleanup(&pc, &mut child, &proc)
+        }),
+    }
+}
+
+fn wait_and_cleanup(pc: &ProcessCount, child: &mut Child, proc: &PreppedProcess) -> io::Result<()> {
+    child.wait()?;
+    pc.decr();
+    if let Some(i) = proc.input_file_name.as_ref() {
+        fs::remove_file(i)?;
     }
     Ok(())
 }
@@ -376,9 +388,9 @@ static NEWLINE: u8 = b"\n"[0];
 static COLON: u8 = b":"[0];
 
 fn copy_output<T: Read, U: Write>(
-    plugin_name: String,
+    plugin_name: &String,
     child_output: T,
-    output: U,
+    output: &mut U,
 ) -> io::Result<()> {
     let mut rdr = BufReader::with_capacity(1024 * 1024, child_output);
     let mut wrt = BufWriter::with_capacity(1024 * 1024, output);
