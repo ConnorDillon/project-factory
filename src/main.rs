@@ -15,6 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use tar::{Archive, Entry};
 use threadpool::ThreadPool;
+use yara::{Compiler, Metadata, MetadataValue, Rules};
 
 fn main() {
     env_logger::init();
@@ -23,21 +24,31 @@ fn main() {
     let params = read_params(&opts, &args);
     if params.help {
         print!("{}", opts.usage("Usage: factory [options]"));
-    } else if let Some(cpath) = params.config {
+    } else if let (Some(cpath), Some(ypath), Some(ipath)) =
+        (params.config, params.yara, params.input)
+    {
         let cfile = File::open(cpath).unwrap();
         let conf: Config = from_reader(cfile).unwrap();
         debug!("Config: {:?}", conf);
-        if let Some(ipath) = params.input {
-            let ifile = File::open(ipath).unwrap();
-            let mut archive = Archive::new(ifile);
-            process_files(&conf, archive.entries().unwrap(), |_| Ok(io::stdout())).unwrap();
-        }
+        let mut compiler = Compiler::new().unwrap();
+        compiler.add_rules_file(ypath).unwrap();
+        let rules = compiler.compile_rules().unwrap();
+        let ifile = File::open(ipath).unwrap();
+        let mut archive = Archive::new(ifile);
+        process_files(
+            &conf,
+            archive.entries().unwrap(),
+            |_| Ok(io::stdout()),
+            rules,
+        )
+        .unwrap();
     }
 }
 
 fn set_opts() -> Options {
     let mut opts = Options::new();
     opts.optflag("h", "help", "Show this help information.");
+    opts.optopt("y", "yara", "Path to the yara rules file", "PATH");
     opts.optopt("c", "config", "Path to the config file", "PATH");
     opts.optopt("i", "input", "Path to the input file", "PATH");
     opts
@@ -48,6 +59,7 @@ fn read_params(opts: &Options, args: &Vec<String>) -> Params {
     Params {
         help: matches.opt_present("help"),
         config: matches.opt_get("config").unwrap(),
+        yara: matches.opt_get("yara").unwrap(),
         input: matches.opt_get("input").unwrap(),
     }
 }
@@ -55,6 +67,7 @@ fn read_params(opts: &Options, args: &Vec<String>) -> Params {
 struct Params {
     help: bool,
     config: Option<PathBuf>,
+    yara: Option<PathBuf>,
     input: Option<PathBuf>,
 }
 
@@ -67,17 +80,18 @@ fn process_files<
     conf: &Config,
     iter: T,
     output: V,
+    rules: Rules,
 ) -> io::Result<()> {
     let tp = ThreadPool::new(num_cpus::get() * 6);
     let pc = ProcessCount::new(num_cpus::get() * 2);
     let mut gen = Gen::new();
-    let mut buf = Vec::with_capacity(1024);
+    let mut buf = Vec::with_capacity(4096);
     for entry_result in iter {
         let mut entry = entry_result?;
         let name = entry.name()?;
         buf.clear();
-        (&mut entry).take(1024).read_to_end(&mut buf)?;
-        match get_file_type(&name, &buf) {
+        (&mut entry).take(4096).read_to_end(&mut buf)?;
+        match get_file_type(&rules, &buf) {
             Some(f) => match conf.get(&f) {
                 Some(p) => {
                     let cur = Cursor::new(&mut buf);
@@ -85,9 +99,9 @@ fn process_files<
                     info!("Processing {} (type: {}) with {}", name, f, p.name);
                     run_process(&tp, pc.clone(), proc, cur.chain(entry), output(f)?)?;
                 }
-                None => error!("File type not included in config: {}", f),
+                None => warn!("File type for {} not included in config: {}", name, f),
             },
-            None => warn!("File type not determined for {}", name),
+            None => warn!("File type for {} was not determined", name),
         }
     }
     tp.join();
@@ -148,22 +162,26 @@ impl ProcessCount {
     }
 }
 
-static LNK_HEADER: [u8; 20] = [
-    0x4c, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x46,
-];
+fn get_file_type(rules: &Rules, head: &[u8]) -> Option<FileType> {
+    rules
+        .scan_mem(head, u16::MAX)
+        .unwrap()
+        .iter()
+        .next()
+        .map(|x| {
+            x.metadatas
+                .iter()
+                .filter(|x| x.identifier == "type")
+                .next()
+                .and_then(meta_string)
+                .unwrap()
+        })
+}
 
-fn get_file_type(_name: &str, head: &[u8]) -> Option<FileType> {
-    if head.len() >= 4 && &head[..4] == b"FILE" {
-        Some("ntfs.mft".into())
-    } else if head.len() >= 9 && &head[..9] == b"#!/bin/sh" {
-        Some("script.sh".into())
-    } else if head.len() >= 4 && &head[..4] == &[0x4d, 0x41, 0x4d, 0x04] {
-        Some("windows.prefetch".into())
-    } else if head.len() >= 20 && &head[..20] == &LNK_HEADER {
-        Some("windows.lnk".into())
-    } else {
-        None
+fn meta_string(meta: &Metadata) -> Option<String> {
+    match meta.value {
+        MetadataValue::String(x) => Some(x.into()),
+        _ => None,
     }
 }
 
@@ -311,7 +329,7 @@ fn spawn_output_handlers<U: Write + Send + 'static>(
         OutputType::file => {
             spawn_logger(tp, Level::Info, stdout, proc.plugin_name.clone());
             spawn(tp, move || {
-	        wait_and_cleanup(&pc, &mut child, &proc)?;
+                wait_and_cleanup(&pc, &mut child, &proc)?;
                 let output_path = proc.output_file_name.unwrap();
                 let output_file = File::open(&output_path)?;
                 copy_output(&proc.plugin_name, output_file, &mut output)?;
@@ -321,20 +339,20 @@ fn spawn_output_handlers<U: Write + Send + 'static>(
         OutputType::dir => {
             spawn_logger(tp, Level::Info, stdout, proc.plugin_name.clone());
             spawn(tp, move || {
-	        wait_and_cleanup(&pc, &mut child, &proc)?;
+                wait_and_cleanup(&pc, &mut child, &proc)?;
                 let output_path = proc.output_file_name.as_ref().unwrap();
                 for entry in fs::read_dir(&output_path)? {
-		    let file_path = entry?.path();
+                    let file_path = entry?.path();
                     let output_file = File::open(&file_path)?;
                     copy_output(&proc.plugin_name, output_file, &mut output)?;
-		    fs::remove_file(file_path)?;
+                    fs::remove_file(file_path)?;
                 }
                 fs::remove_dir(&output_path)
             });
         }
         OutputType::stdout => spawn(tp, move || {
             copy_output(&proc.plugin_name, stdout.unwrap(), &mut output)?;
-	    wait_and_cleanup(&pc, &mut child, &proc)
+            wait_and_cleanup(&pc, &mut child, &proc)
         }),
     }
 }
@@ -490,18 +508,32 @@ mod tests {
             output: Some(OutputType::stdout),
         };
         let mut config = HashMap::new();
-        config.insert(String::from("script.sh"), plugin);
+        config.insert(String::from("script/sh"), plugin);
         let files = vec![Ok(NamedCursor(
             "bar".into(),
             Cursor::new((*b"#!/bin/sh\necho foobar").into()),
         ))];
         let open_output = |_| File::create("test_process_files");
-        process_files(&config, files.into_iter(), open_output).unwrap();
+        process_files(&config, files.into_iter(), open_output, sh_rules()).unwrap();
         let mut output = File::open("test_process_files").unwrap();
         let mut result = Vec::new();
         output.read_to_end(&mut result).unwrap();
         fs::remove_file("test_process_files").unwrap();
         assert_eq!(&result, b"foo:foobar\n");
+    }
+
+    fn sh_rules() -> Rules {
+        let rules = r#"
+rule ScriptSh
+{
+    meta: type = "script/sh"
+    strings: $sb = { 23 21 }
+    condition: $sb at 0
+}
+"#;
+        let mut compiler = Compiler::new().unwrap();
+        compiler.add_rules_str(rules).unwrap();
+        compiler.compile_rules().unwrap()
     }
 
     struct NamedCursor(String, Cursor<Vec<u8>>);

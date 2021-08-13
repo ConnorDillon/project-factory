@@ -13,3 +13,5 @@ log = "^0.4.8"
 env_logger = "^0.9.0"
 threadpool = "^1.8.1"
 num_cpus = "^1.13.0"
+yara = "^0.9.0"
+yara-sys = { version = "^0.8.0", features = ["bundled-4_1_1"] }
