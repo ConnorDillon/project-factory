@@ -1,8 +1,6 @@
 use serde::Deserialize;
-use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::HashMap;
 use std::env;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -46,7 +44,7 @@ pub struct PreppedProcess {
     pub unpacker: bool,
 }
 
-pub fn prep_process(gen: &mut Gen, plugin: &Plugin) -> PreppedProcess {
+pub fn prep_process(plugin: &Plugin) -> PreppedProcess {
     let mut cmd = Command::new(&plugin.path);
     let mut args = plugin.args.clone().unwrap_or(Vec::new());
     let input_type = plugin.input.unwrap_or(InputType::file);
@@ -58,7 +56,7 @@ pub fn prep_process(gen: &mut Gen, plugin: &Plugin) -> PreppedProcess {
         }
         InputType::file => {
             cmd.stdin(Stdio::null());
-            let path = gen_io_path(gen).unwrap();
+            let path = gen_io_path().unwrap();
             cmd.env("INPUT", &path);
             replace_arg(&mut args, "$INPUT", &path);
             Some(path)
@@ -66,8 +64,8 @@ pub fn prep_process(gen: &mut Gen, plugin: &Plugin) -> PreppedProcess {
     };
     let output_file_name = match output_type {
         OutputType::stdout => None,
-        OutputType::dir => Some(gen_io_path(gen).unwrap()),
-        OutputType::file => Some(gen_io_path(gen).unwrap()),
+        OutputType::dir => Some(gen_io_path().unwrap()),
+        OutputType::file => Some(gen_io_path().unwrap()),
     };
     if let Some(path) = &output_file_name {
         cmd.env("OUTPUT", path);
@@ -98,54 +96,20 @@ fn replace_arg(args: &mut Vec<String>, var: &str, rep: &str) {
     }
 }
 
-pub struct Gen(u64, String, DefaultHasher);
-
-impl Gen {
-    pub fn new() -> Gen {
-        Gen(
-            0,
-            String::with_capacity(16),
-            RandomState::new().build_hasher(),
-        )
-    }
-
-    fn gen_str(&mut self) -> &str {
-        self.0.hash(&mut self.2);
-        self.0 = self.2.finish();
-        self.1 = format!("{:016x}", self.0);
-        &self.1
-    }
-
-    pub fn gen_string(&mut self) -> String {
-        self.gen_str().to_string()
-    }
-}
-
-fn gen_io_path(gen: &mut Gen) -> io::Result<String> {
+fn gen_io_path() -> io::Result<String> {
     let mut path = env::current_dir()?;
-    let name = gen.gen_string();
+    let r: u64 = rand::random();
+    let name = format!("{:016x}", r);
     path.push(name);
     Ok(path.to_str().unwrap().into())
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_gen() {
-        let mut gen = Gen::new();
-        let v1 = gen.gen_string();
-        let v2 = gen.gen_string();
-        let v3 = gen.gen_string();
-        assert_ne!(v1, v2);
-        assert_ne!(v2, v3);
-    }
-
-    #[test]
     fn test_prep_process() {
-        let mut gen = Gen::new();
         let plugin = Plugin {
             name: "foo".into(),
             path: "bar".into(),
@@ -154,7 +118,7 @@ mod tests {
             output: Some(OutputType::stdout),
             unpacker: None,
         };
-        let proc = prep_process(&mut gen, &plugin);
+        let proc = prep_process(&plugin);
         assert_eq!(
             proc.input_file_name,
             proc.command

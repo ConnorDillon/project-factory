@@ -7,7 +7,7 @@ use tar::Entry;
 use threadpool::ThreadPool;
 use yara::{Metadata, MetadataValue, Rules};
 
-use crate::plugin::{self, Config, FileType, Gen, InputType, OutputType, PreppedProcess};
+use crate::plugin::{self, Config, FileType, InputType, OutputType, PreppedProcess};
 
 pub fn process_files<
     T: Iterator<Item = io::Result<U>>,
@@ -22,7 +22,6 @@ pub fn process_files<
 ) -> io::Result<()> {
     let tp = ThreadPool::new(num_cpus::get() * 6);
     let pc = ProcessCount::new(num_cpus::get() * 2);
-    let mut gen = Gen::new();
     let mut buf = Vec::with_capacity(4096);
     for entry_result in iter {
         let mut entry = entry_result?;
@@ -33,7 +32,7 @@ pub fn process_files<
             Some(f) => match conf.get(&f) {
                 Some(p) => {
                     let cur = Cursor::new(&mut buf);
-                    let proc = plugin::prep_process(&mut gen, p);
+                    let proc = plugin::prep_process(p);
                     info!("Processing {} (type: {}) with {}", name, f, p.name);
                     run_process(&tp, pc.clone(), proc, cur.chain(entry), output(f)?)?;
                 }
@@ -267,7 +266,6 @@ mod tests {
         //env_logger::builder().is_test(true).try_init().unwrap();
         let tp = ThreadPool::new(3);
         let pc = ProcessCount::new(1);
-        let mut gen = Gen::new();
         let plugin = Plugin {
             name: "foo".into(),
             path: "/bin/sh".into(),
@@ -276,7 +274,7 @@ mod tests {
             output: Some(OutputType::stdout),
             unpacker: None,
         };
-        let proc = plugin::prep_process(&mut gen, &plugin);
+        let proc = plugin::prep_process(&plugin);
         let mut expected = Vec::new();
         expected.extend_from_slice(b"foo:");
         expected.extend_from_slice(&proc.input_file_name.as_ref().unwrap().as_bytes());
