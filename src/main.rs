@@ -3,10 +3,10 @@
 use getopts::Options;
 use log::debug;
 use serde_yaml::from_reader;
-use std::env;
 use std::fs::File;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::{env, fs};
 use yara::Compiler;
 
 use crate::plugin::Config;
@@ -31,14 +31,20 @@ fn main() {
         let mut compiler = Compiler::new().unwrap();
         compiler.add_rules_file(ypath).unwrap();
         let rules = compiler.compile_rules().unwrap();
-	let cpus = num_cpus::get();
-	let global = Global::new(conf, rules, cpus, cpus * 2);
-	if ipath.is_file() {
-	    process::process_file(global.clone(), ipath, false, Output(io::stdout())).unwrap();
-	} else if ipath.is_dir() {
-	    process::process_dir(global.clone(), ipath, false, Output(io::stdout())).unwrap();
-	}
-	global.join();
+        let cpus = num_cpus::get();
+        let global = Global::new(conf, rules, cpus, cpus * 2);
+        let input_path = fs::canonicalize(ipath).unwrap();
+        let working_dir = plugin::gen_path().unwrap();
+        fs::create_dir(&working_dir).unwrap();
+        env::set_current_dir(&working_dir).unwrap();
+        if input_path.is_file() {
+            process::process_file(global.clone(), input_path, false, Output(io::stdout())).unwrap();
+        } else if input_path.is_dir() {
+            process::process_dir(global.clone(), input_path, false, Output(io::stdout())).unwrap();
+        }
+        global.join();
+        env::set_current_dir(&working_dir.parent().unwrap()).unwrap();
+        fs::remove_dir_all(working_dir).unwrap();
     }
 }
 

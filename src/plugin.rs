@@ -115,7 +115,7 @@ pub fn prep_process(plugin: &Plugin, input_file: Option<InputFile>) -> PreppedPr
             let (input_path, temp_path) = if let Some(infile) = &input_file {
                 (Some(&infile.path), None)
             } else {
-                (None, Some(gen_io_path().unwrap()))
+                (None, Some(gen_path().unwrap()))
             };
             let path = input_path.or(temp_path.as_ref()).unwrap();
             cmd.env("INPUT", &path);
@@ -126,11 +126,11 @@ pub fn prep_process(plugin: &Plugin, input_file: Option<InputFile>) -> PreppedPr
     let output_path = match output_type {
         OutputType::stdout => None,
         OutputType::dir => {
-            let path = gen_io_path().unwrap();
+            let path = gen_path().unwrap();
             cmd.current_dir(&path);
             Some(path)
         },
-        OutputType::file => Some(gen_io_path().unwrap()),
+        OutputType::file => Some(gen_path().unwrap()),
     };
     if let Some(path) = &output_path {
         cmd.env("OUTPUT", path);
@@ -162,7 +162,7 @@ fn replace_arg(args: &mut Vec<String>, var: &str, rep: &str) {
     }
 }
 
-fn gen_io_path() -> io::Result<PathBuf> {
+pub fn gen_path() -> io::Result<PathBuf> {
     let mut path = env::current_dir()?;
     let r: u64 = rand::random();
     let name = format!("{:016x}", r);
