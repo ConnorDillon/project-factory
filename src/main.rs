@@ -5,12 +5,12 @@ use log::debug;
 use serde_yaml::from_reader;
 use std::env;
 use std::fs::File;
-use std::io;
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
-use tar::Archive;
 use yara::Compiler;
 
 use crate::plugin::Config;
+use crate::process::Global;
 
 mod plugin;
 mod process;
@@ -31,15 +31,14 @@ fn main() {
         let mut compiler = Compiler::new().unwrap();
         compiler.add_rules_file(ypath).unwrap();
         let rules = compiler.compile_rules().unwrap();
-        let ifile = File::open(ipath).unwrap();
-        let mut archive = Archive::new(ifile);
-        process::process_files(
-            &conf,
-            archive.entries().unwrap(),
-            |_| Ok(io::stdout()),
-            rules,
-        )
-        .unwrap();
+	let cpus = num_cpus::get();
+	let global = Global::new(conf, rules, cpus, cpus * 2);
+	if ipath.is_file() {
+	    process::process_file(global.clone(), ipath, false, Output(io::stdout())).unwrap();
+	} else if ipath.is_dir() {
+	    process::process_dir(global.clone(), ipath, false, Output(io::stdout())).unwrap();
+	}
+	global.join();
     }
 }
 
@@ -67,4 +66,24 @@ struct Params {
     config: Option<PathBuf>,
     yara: Option<PathBuf>,
     input: Option<PathBuf>,
+}
+
+struct Output(Stdout);
+
+impl Clone for Output {
+    fn clone(&self) -> Output {
+        Output(io::stdout())
+    }
+}
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.write_all(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }

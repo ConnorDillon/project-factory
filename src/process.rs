@@ -1,77 +1,293 @@
-use log::{debug, error, info, trace, warn, Level};
+use log::{debug, error, info, warn};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
-use std::process::Child;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use tar::Entry;
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 use threadpool::ThreadPool;
+use walkdir::WalkDir;
 use yara::{Metadata, MetadataValue, Rules};
 
-use crate::plugin::{self, Config, FileType, InputType, OutputType, PreppedProcess};
+use crate::plugin::{self, Config, FileType, InputFile, InputType, OutputType, PreppedProcess};
 
-pub fn process_files<
-    T: Iterator<Item = io::Result<U>>,
-    U: Read + Name,
-    V: Fn(String) -> io::Result<W>,
-    W: Write + Send + 'static,
->(
-    conf: &Config,
-    iter: T,
-    output: V,
-    rules: Rules,
-) -> io::Result<()> {
-    let tp = ThreadPool::new(num_cpus::get() * 6);
-    let pc = ProcessCount::new(num_cpus::get() * 2);
-    let mut buf = Vec::with_capacity(4096);
-    for entry_result in iter {
-        let mut entry = entry_result?;
-        let name = entry.name()?;
-        buf.clear();
-        (&mut entry).take(4096).read_to_end(&mut buf)?;
-        match get_file_type(&rules, &buf) {
-            Some(f) => match conf.get(&f) {
-                Some(p) => {
-                    let cur = Cursor::new(&mut buf);
-                    let proc = plugin::prep_process(p);
-                    info!("Processing {} (type: {}) with {}", name, f, p.name);
-                    run_process(&tp, pc.clone(), proc, cur.chain(entry), output(f)?)?;
-                }
-                None => warn!("File type for {} not included in config: {}", name, f),
-            },
-            None => warn!("File type for {} was not determined", name),
-        }
-    }
-    tp.join();
-    Ok(())
+pub trait Name {
+    fn name(&self) -> io::Result<String>;
 }
 
 #[derive(Clone)]
-struct ProcessCount(Arc<(Mutex<usize>, Condvar, usize)>);
+pub struct Global {
+    primary_pool: ThreadPool,
+    secondary_pool: ThreadPool,
+    conf: Arc<Config>,
+    rules: Arc<Rules>,
+}
 
-impl ProcessCount {
-    fn new(max: usize) -> ProcessCount {
-        ProcessCount(Arc::new((Mutex::new(0), Condvar::new(), max)))
+impl Global {
+    pub fn new(conf: Config, rules: Rules, primary_size: usize, secondary_size: usize) -> Global {
+        Global {
+            primary_pool: ThreadPool::new(primary_size),
+            secondary_pool: ThreadPool::new(secondary_size),
+            conf: Arc::new(conf),
+            rules: Arc::new(rules),
+        }
     }
 
-    fn wait(&self, count: usize) -> MutexGuard<usize> {
-        let (lock, cvar, _) = &*self.0;
-        cvar.wait_while(lock.lock().unwrap(), |c| *c > count)
-            .unwrap()
+    fn execute_primary<T>(&self, f: T)
+    where
+        T: FnOnce() -> io::Result<()> + Send + 'static,
+    {
+        spawn(&self.primary_pool, f)
     }
 
-    fn incr(&self) {
-        let mut count = self.wait(self.0 .2);
-        *count = *count + 1;
+    fn execute_secondary<T>(&self, f: T)
+    where
+        T: FnOnce() -> io::Result<()> + Send + 'static,
+    {
+        spawn(&self.secondary_pool, f)
     }
 
-    fn decr(&self) {
-        let mut count = self.0 .0.lock().unwrap();
-        *count = *count - 1;
-        self.0 .1.notify_all();
+    pub fn join(&self) {
+        while self.primary_pool.active_count()
+            + self.secondary_pool.active_count()
+            + self.primary_pool.queued_count()
+            + self.secondary_pool.queued_count()
+            > 0
+        {
+            self.primary_pool.join();
+            self.secondary_pool.join();
+        }
     }
 }
 
-fn get_file_type(rules: &Rules, head: &[u8]) -> Option<FileType> {
+fn spawn<T>(tp: &ThreadPool, f: T)
+where
+    T: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    tp.execute(|| match f() {
+        Ok(()) => {}
+        Err(x) => {
+            error!("{:?}", x);
+        }
+    })
+}
+
+pub struct Input<T> {
+    pub name: String,
+    pub data: T,
+}
+
+impl<T> Input<T> {
+    pub fn new<U: Into<String>>(name: U, data: T) -> Input<T> {
+        Input {
+            name: name.into(),
+            data,
+        }
+    }
+}
+
+impl<T: Read> Read for Input<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.data.read(buf)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.data.read_exact(buf)
+    }
+}
+
+pub fn process_dir<T: Write + Clone + Send + 'static>(
+    global: Global,
+    path: PathBuf,
+    cleanup: bool,
+    output: T,
+) -> io::Result<()> {
+    for entry in WalkDir::new(&path).into_iter().map(|x| x.unwrap()) {
+        let file_path = entry.path().to_owned();
+        if file_path.is_file() {
+            let glob = global.clone();
+            let outp = output.clone();
+            global.execute_primary(move || process_file(glob, file_path, cleanup, outp));
+        }
+    }
+    Ok(())
+}
+
+pub fn process_file<T: Write + Clone + Send + 'static>(
+    global: Global,
+    path: PathBuf,
+    cleanup: bool,
+    output: T,
+) -> io::Result<()> {
+    debug!("Started processing input file: {:?}", path);
+    let input_file = File::open(&path)?;
+    let name = path.file_name().unwrap().to_str().unwrap().to_string();
+    process_input(
+        global,
+        Input::new(name, input_file),
+        Some(InputFile::new(path.clone(), cleanup)),
+        output,
+    )?;
+    debug!("Finished processing input file: {:?}", path);
+    Ok(())
+}
+
+fn process_input<T: Read, U: Write + Clone + Send + 'static>(
+    global: Global,
+    mut input: Input<T>,
+    input_file: Option<InputFile>,
+    output: U,
+) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(4096);
+    buf.clear();
+    (&mut input).take(4096).read_to_end(&mut buf)?;
+    match get_file_type(&global.rules, &buf) {
+        Some(f) => match global.conf.get(&f) {
+            Some(p) => {
+                let cur = Cursor::new(&mut buf);
+                let input = Input::new(input.name, cur.chain(input.data));
+                let proc = plugin::prep_process(p, input_file);
+                debug!("Prepped process: {:?}", proc);
+                info!("Processing {} (type: {}) with {}", input.name, f, p.name);
+                run_process(global, proc, input, output)?;
+            }
+            None => {
+                if let Some(infile) = input_file {
+                    infile.cleanup()?;
+                }
+                warn!("File type for {} not included in config: {}", input.name, f)
+            }
+        },
+        None => {
+            if let Some(infile) = input_file {
+                infile.cleanup()?;
+            }
+            warn!("File type for {} was not determined", input.name)
+        }
+    }
+    Ok(())
+}
+
+fn run_process<T: Read, U: Write + Clone + Send + 'static>(
+    global: Global,
+    mut proc: PreppedProcess,
+    mut input: Input<T>,
+    output: U,
+) -> io::Result<()> {
+    proc.prepare_input(&mut input)?;
+    let mut child = proc.command.spawn()?;
+    let stderr = child.stderr.take().unwrap();
+    let plugin_name = proc.plugin_name.clone();
+    global.execute_secondary(|| handle_stderr(stderr, plugin_name));
+    if proc.output_type == OutputType::stdout {
+        let stdout = child.stdout.take().unwrap();
+        let unpacker = proc.unpacker;
+        let plugin_name = proc.plugin_name.clone();
+        let input_name = input.name.clone();
+        let glob = global.clone();
+        let outp = output.clone();
+        global.execute_secondary(move || {
+            handle_stdout(glob, unpacker, plugin_name, input_name, stdout, outp)
+        });
+    }
+    if proc.input_type == InputType::stdin {
+        let mut stdin = child.stdin.take().unwrap();
+        io::copy(&mut input, &mut stdin)?;
+    }
+    child.wait()?;
+    proc.cleanup_input()?;
+    if proc.output_type != OutputType::stdout {
+        let glob = global.clone();
+        global.execute_secondary(move || handle_output_files(glob, proc, output));
+    }
+    Ok(())
+}
+
+fn handle_stdout<T: Read, U: Write + Clone + Send + 'static>(
+    global: Global,
+    unpacker: bool,
+    plugin_name: String,
+    input_name: String,
+    stdout: T,
+    mut output: U,
+) -> io::Result<()>
+where
+{
+    if unpacker {
+        process_input(global, Input::new(input_name, stdout), None, output)
+    } else {
+        copy_output(&plugin_name, stdout, &mut output)
+    }
+}
+
+fn handle_output_files<T: Write + Clone + Send + 'static>(
+    global: Global,
+    proc: PreppedProcess,
+    mut output: T,
+) -> io::Result<()> {
+    if proc.output_type == OutputType::file {
+        if proc.unpacker {
+            let path = proc.output_path.unwrap();
+            process_file(global, path, true, output)?
+        } else {
+            let path = proc.output_path.unwrap();
+            let output_file = File::open(&path)?;
+            copy_output(&proc.plugin_name, output_file, &mut output)?;
+            fs::remove_file(path)?
+        }
+    } else if proc.output_type == OutputType::dir {
+        if proc.unpacker {
+            process_dir(global, proc.output_path.unwrap(), true, output)?;
+        } else {
+            let path = proc.output_path.unwrap();
+            for entry in WalkDir::new(&path).into_iter().map(|x| x.unwrap()) {
+                let file_path = entry.path();
+                if file_path.is_file() {
+                    let output_file = File::open(&file_path)?;
+                    copy_output(&proc.plugin_name, output_file, &mut output)?;
+                    fs::remove_file(file_path)?;
+                }
+            }
+            fs::remove_dir_all(&path)?
+        }
+    }
+    Ok(())
+}
+
+fn handle_stderr<T: Read>(rdr: T, plugin_name: String) -> io::Result<()> {
+    let mut bufrdr = BufReader::new(rdr);
+    let mut buf = String::new();
+    while bufrdr.read_line(&mut buf)? > 0 {
+        error!("PLUGIN {}: {}", plugin_name, buf.trim());
+        buf.clear();
+    }
+    Ok(())
+}
+
+static NEWLINE: u8 = b"\n"[0];
+
+static COLON: u8 = b":"[0];
+
+fn copy_output<T: Read, U: Write>(
+    plugin_name: &String,
+    child_output: T,
+    output: &mut U,
+) -> io::Result<()> {
+    let mut rdr = BufReader::with_capacity(1024 * 1024, child_output);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(plugin_name.as_bytes());
+    buf.push(COLON);
+    while rdr.read_until(NEWLINE, &mut buf)? > 0 {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+        buf.push(NEWLINE);
+        output.write_all(&buf)?;
+        buf.truncate(plugin_name.len() + 1);
+    }
+    Ok(())
+}
+
+pub fn get_file_type(rules: &Rules, head: &[u8]) -> Option<FileType> {
     rules
         .scan_mem(head, u16::MAX)
         .unwrap()
@@ -94,178 +310,17 @@ fn meta_string(meta: &Metadata) -> Option<String> {
     }
 }
 
-pub trait Name {
-    fn name(&self) -> io::Result<String>;
-}
-
-impl<T: Read> Name for Entry<'_, T> {
-    fn name(&self) -> io::Result<String> {
-        let path = self.path()?;
-        Ok(String::from(path.file_name().unwrap().to_str().unwrap()))
-    }
-}
-
-fn run_process<T: Read, U: Write + Send + 'static>(
-    tp: &ThreadPool,
-    pc: ProcessCount,
-    mut proc: PreppedProcess,
-    mut input: T,
-    output: U,
-) -> io::Result<()> {
-    if proc.output_type == OutputType::dir {
-        fs::create_dir(proc.output_file_name.as_ref().unwrap())?;
-    }
-    match proc.input_type {
-        InputType::file => {
-            let input_path = proc.input_file_name.as_ref().unwrap();
-            io::copy(&mut input, &mut File::create(&input_path)?)?;
-            pc.incr();
-            let child = proc.command.spawn()?;
-            spawn_output_handlers(tp, pc, proc, output, child);
-        }
-        InputType::stdin => {
-            pc.incr();
-            let mut child = proc.command.spawn()?;
-            let mut stdin = child.stdin.take().unwrap();
-            spawn_output_handlers(tp, pc, proc, output, child);
-            io::copy(&mut input, &mut stdin)?;
-        }
-    };
-    Ok(())
-}
-
-fn spawn_output_handlers<U: Write + Send + 'static>(
-    tp: &ThreadPool,
-    pc: ProcessCount,
-    proc: PreppedProcess,
-    mut output: U,
-    mut child: Child,
-) {
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    spawn_logger(tp, Level::Error, stderr, proc.plugin_name.clone());
-    match proc.output_type {
-        OutputType::file => {
-            spawn_logger(tp, Level::Info, stdout, proc.plugin_name.clone());
-            spawn(tp, move || {
-                wait_and_cleanup(&pc, &mut child, &proc)?;
-                if !proc.unpacker {
-                    let output_path = proc.output_file_name.unwrap();
-                    let output_file = File::open(&output_path)?;
-                    copy_output(&proc.plugin_name, output_file, &mut output)?;
-                    fs::remove_file(&output_path)?;
-                }
-                Ok(())
-            });
-        }
-        OutputType::dir => {
-            spawn_logger(tp, Level::Info, stdout, proc.plugin_name.clone());
-            spawn(tp, move || {
-                wait_and_cleanup(&pc, &mut child, &proc)?;
-                if !proc.unpacker {
-                    let output_path = proc.output_file_name.as_ref().unwrap();
-                    for entry in fs::read_dir(&output_path)? {
-                        let file_path = entry?.path();
-                        let output_file = File::open(&file_path)?;
-                        copy_output(&proc.plugin_name, output_file, &mut output)?;
-                        fs::remove_file(file_path)?;
-                    }
-                    fs::remove_dir(&output_path)?;
-                }
-                Ok(())
-            });
-        }
-        OutputType::stdout => spawn(tp, move || {
-            if !proc.unpacker {
-                copy_output(&proc.plugin_name, stdout.unwrap(), &mut output)?;
-            }
-            wait_and_cleanup(&pc, &mut child, &proc)
-        }),
-    }
-}
-
-fn wait_and_cleanup(pc: &ProcessCount, child: &mut Child, proc: &PreppedProcess) -> io::Result<()> {
-    child.wait()?;
-    pc.decr();
-    if let Some(i) = proc.input_file_name.as_ref() {
-        fs::remove_file(i)?;
-    }
-    Ok(())
-}
-
-fn spawn_logger<T>(tp: &ThreadPool, level: Level, rdr: Option<T>, plugin_name: String)
-where
-    T: Read + Send + 'static,
-{
-    let mut bufrdr = BufReader::new(rdr.unwrap());
-    spawn(tp, move || {
-        let mut buf = String::new();
-        while bufrdr.read_line(&mut buf)? > 0 {
-            match level {
-                Level::Error => error!("PLUGIN {}: {}", plugin_name, buf.trim()),
-                Level::Warn => warn!("PLUGIN {}: {}", plugin_name, buf.trim()),
-                Level::Info => info!("PLUGIN {}: {}", plugin_name, buf.trim()),
-                Level::Debug => debug!("PLUGIN {}: {}", plugin_name, buf.trim()),
-                Level::Trace => trace!("PLUGIN {}: {}", plugin_name, buf.trim()),
-            }
-            buf.clear();
-        }
-        Ok(())
-    })
-}
-
-fn spawn<F, T>(tp: &ThreadPool, f: F)
-where
-    F: FnOnce() -> io::Result<T>,
-    F: Send + 'static,
-    T: Send + 'static,
-{
-    tp.execute(|| match f() {
-        Ok(_) => {}
-        Err(x) => {
-            error!("{:?}", x);
-        }
-    })
-}
-
-static NEWLINE: u8 = b"\n"[0];
-
-static COLON: u8 = b":"[0];
-
-fn copy_output<T: Read, U: Write>(
-    plugin_name: &String,
-    child_output: T,
-    output: &mut U,
-) -> io::Result<()> {
-    let mut rdr = BufReader::with_capacity(1024 * 1024, child_output);
-    let mut wrt = BufWriter::with_capacity(1024 * 1024, output);
-    let mut buf = Vec::new();
-    buf.extend_from_slice(plugin_name.as_bytes());
-    buf.push(COLON);
-    while rdr.read_until(NEWLINE, &mut buf)? > 0 {
-        buf.pop();
-        if buf.ends_with(b"\r") {
-            buf.pop();
-        }
-        buf.push(NEWLINE);
-        wrt.write(&buf)?;
-        buf.truncate(plugin_name.len() + 1);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugin::Plugin;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Mutex, thread, time::Duration};
     use yara::Compiler;
 
     #[test]
     fn test_run_process() {
         //env_logger::builder().is_test(true).try_init().unwrap();
-        let tp = ThreadPool::new(3);
-        let pc = ProcessCount::new(1);
+        let global = Global::new(HashMap::new(), sh_rules(), 2, 4);
         let plugin = Plugin {
             name: "foo".into(),
             path: "/bin/sh".into(),
@@ -274,30 +329,28 @@ mod tests {
             output: Some(OutputType::stdout),
             unpacker: None,
         };
-        let proc = plugin::prep_process(&plugin);
+        let input = Input::new("", Cursor::new(b"echo $INPUT"));
+        let proc = plugin::prep_process(&plugin, None);
         let mut expected = Vec::new();
         expected.extend_from_slice(b"foo:");
-        expected.extend_from_slice(&proc.input_file_name.as_ref().unwrap().as_bytes());
+        expected.extend_from_slice(
+            &proc
+                .input_path()
+                .as_ref()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .as_bytes(),
+        );
         expected.push(NEWLINE);
-        let input = Cursor::new(b"echo $INPUT");
-        run_process(
-            &tp,
-            pc,
-            proc,
-            input,
-            File::create("test_run_process").unwrap(),
-        )
-        .unwrap();
-        tp.join();
-        let mut output = File::open("test_run_process").unwrap();
-        let mut result = Vec::new();
-        output.read_to_end(&mut result).unwrap();
-        fs::remove_file("test_run_process").unwrap();
-        assert_eq!(result, expected);
+        let output = SharedCursor::new();
+        run_process(global.clone(), proc, input, output.clone()).unwrap();
+        global.join();
+        assert_eq!(output.into_inner(), expected);
     }
 
     #[test]
-    fn test_process_files() {
+    fn test_process_input() {
         let plugin = Plugin {
             name: "foo".into(),
             path: "/bin/sh".into(),
@@ -308,17 +361,45 @@ mod tests {
         };
         let mut config = HashMap::new();
         config.insert(String::from("script/sh"), plugin);
-        let files = vec![Ok(NamedCursor(
-            "bar".into(),
-            Cursor::new((*b"#!/bin/sh\necho foobar").into()),
-        ))];
-        let open_output = |_| File::create("test_process_files");
-        process_files(&config, files.into_iter(), open_output, sh_rules()).unwrap();
-        let mut output = File::open("test_process_files").unwrap();
-        let mut result = Vec::new();
-        output.read_to_end(&mut result).unwrap();
-        fs::remove_file("test_process_files").unwrap();
-        assert_eq!(&result, b"foo:foobar\n");
+        let file = Input::new("bar", Cursor::new(Vec::from(*b"#!/bin/sh\necho foobar")));
+        let global = Global::new(config, sh_rules(), 2, 4);
+        let output = SharedCursor::new();
+        process_input(global.clone(), file, None, output.clone()).unwrap();
+        assert_eq!(output.into_inner(), b"foo:foobar\n");
+    }
+
+    #[derive(Clone)]
+    struct SharedCursor(Arc<Mutex<Cursor<Vec<u8>>>>);
+
+    impl SharedCursor {
+        fn new() -> SharedCursor {
+            SharedCursor(Arc::new(Mutex::new(Cursor::new(Vec::new()))))
+        }
+
+        fn into_inner(self) -> Vec<u8> {
+            while Arc::strong_count(&self.0) > 1 {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Arc::try_unwrap(self.0)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .into_inner()
+        }
+    }
+
+    impl Write for SharedCursor {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.0.lock().unwrap().write_all(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
     }
 
     fn sh_rules() -> Rules {
@@ -333,19 +414,5 @@ rule ScriptSh
         let mut compiler = Compiler::new().unwrap();
         compiler.add_rules_str(rules).unwrap();
         compiler.compile_rules().unwrap()
-    }
-
-    struct NamedCursor(String, Cursor<Vec<u8>>);
-
-    impl Name for NamedCursor {
-        fn name(&self) -> io::Result<String> {
-            Ok(self.0.clone())
-        }
-    }
-
-    impl Read for NamedCursor {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.1.read(buf)
-        }
     }
 }
