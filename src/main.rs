@@ -2,12 +2,13 @@
 
 use getopts::Options;
 use log::debug;
+use process::Input;
 use serde_yaml::from_reader;
 use std::fs::File;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::{env, fs};
-use yara::Compiler;
+use yara::{Compiler, Rules};
 
 use crate::plugin::Config;
 use crate::process::Global;
@@ -22,38 +23,63 @@ fn main() {
     let params = read_params(&opts, &args);
     if params.help {
         print!("{}", opts.usage("Usage: factory [options]"));
-    } else if let (Some(cpath), Some(ypath), Some(ipath)) =
-        (params.config, params.yara, params.input)
-    {
+    } else if let (Some(cpath), Some(ypath)) = (params.config, params.yara) {
         let cfile = File::open(cpath).unwrap();
         let conf: Config = from_reader(cfile).unwrap();
         debug!("Config: {:?}", conf);
         let mut compiler = Compiler::new().unwrap();
         compiler.add_rules_file(ypath).unwrap();
         let rules = compiler.compile_rules().unwrap();
-        let cpus = num_cpus::get();
-        let global = Global::new(conf, rules, cpus, cpus * 2);
-        let input_path = fs::canonicalize(ipath).unwrap();
-        let working_dir = plugin::gen_path().unwrap();
-        fs::create_dir(&working_dir).unwrap();
-        env::set_current_dir(&working_dir).unwrap();
-        if input_path.is_file() {
-            process::process_file(global.clone(), input_path, false, Output(io::stdout())).unwrap();
-        } else if input_path.is_dir() {
-            process::process_dir(global.clone(), input_path, false, Output(io::stdout())).unwrap();
-        }
-        global.join();
-        env::set_current_dir(&working_dir.parent().unwrap()).unwrap();
-        fs::remove_dir_all(working_dir).unwrap();
+        execute(params.input, conf, rules, Output(io::stdout())).unwrap();
+    } else {
+        print!("{}", opts.usage("Usage: factory [options]"));
     }
+}
+
+fn execute<T>(input: Option<PathBuf>, config: Config, rules: Rules, output: T) -> io::Result<()>
+where
+    T: Write + Clone + Send + 'static,
+{
+    let cpus = num_cpus::get();
+    let global = Global::new(config, rules, cpus, cpus * 2);
+    let input_path = match input {
+        Some(p) => Some(fs::canonicalize(p)?),
+        None => None,
+    };
+    let working_dir = plugin::gen_path()?;
+    fs::create_dir(&working_dir).unwrap();
+    env::set_current_dir(&working_dir)?;
+    if let Some(path) = input_path {
+        if path.is_dir() {
+            process::process_dir(global.clone(), path, false, output)?;
+        } else {
+            process::process_file(global.clone(), path, false, output)?;
+        }
+    } else {
+        process::process_input(global.clone(), Input::new("", io::stdin()), None, output)?;
+    }
+    global.join();
+    env::set_current_dir(&working_dir.parent().unwrap())?;
+    fs::remove_dir_all(working_dir).unwrap();
+    Ok(())
 }
 
 fn set_opts() -> Options {
     let mut opts = Options::new();
     opts.optflag("h", "help", "Show this help information.");
-    opts.optopt("y", "yara", "Path to the yara rules file", "PATH");
-    opts.optopt("c", "config", "Path to the config file", "PATH");
-    opts.optopt("i", "input", "Path to the input file", "PATH");
+    opts.optopt(
+        "y",
+        "yara",
+        "Path to the yara rules file (required)",
+        "PATH",
+    );
+    opts.optopt("c", "config", "Path to the config file (required)", "PATH");
+    opts.optopt(
+        "i",
+        "input",
+        "Path to the input file (will read from stdin if not specified)",
+        "PATH",
+    );
     opts
 }
 

@@ -130,7 +130,7 @@ pub fn process_file<T: Write + Clone + Send + 'static>(
     Ok(())
 }
 
-fn process_input<T: Read, U: Write + Clone + Send + 'static>(
+pub fn process_input<T: Read, U: Write + Clone + Send + 'static>(
     global: Global,
     mut input: Input<T>,
     input_file: Option<InputFile>,
