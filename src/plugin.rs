@@ -1,9 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -21,131 +19,49 @@ pub struct Plugin {
     pub unpacker: Option<bool>,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
-#[allow(non_camel_case_types)]
-pub enum InputType {
-    file,
-    stdin,
-}
-
-#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
-#[allow(non_camel_case_types)]
-pub enum OutputType {
-    file,
-    dir,
-    stdout,
-}
-
-#[derive(Debug)]
-pub struct PreppedProcess {
-    pub command: Command,
-    temp_input_path: Option<PathBuf>,
-    pub output_path: Option<PathBuf>,
-    pub input_type: InputType,
-    pub output_type: OutputType,
-    pub plugin_name: String,
-    pub unpacker: bool,
-    input_file: Option<InputFile>,
-}
-
-impl PreppedProcess {
-    #[allow(dead_code)]
-    pub fn input_path(&self) -> Option<&PathBuf> {
-        self.temp_input_path
-            .as_ref()
-            .or(self.input_file.as_ref().map(|x| &x.path))
-    }
-
-    pub fn prepare_input<T: Read>(&self, input: &mut T) -> io::Result<()> {
-        if self.output_type == OutputType::dir {
-            fs::create_dir(self.output_path.as_ref().unwrap())?;
-        }
-        if let Some(path) = &self.temp_input_path {
-            io::copy(input, &mut File::create(path)?)?;
-        }
-        Ok(())
-    }
-
-    pub fn cleanup_input(&self) -> io::Result<()> {
-        if let Some(path) = &self.temp_input_path {
-            fs::remove_file(path)?;
-        } else if let Some(infile) = &self.input_file {
-            if infile.temp {
-                fs::remove_file(&infile.path)?;
+impl Plugin {
+    pub fn prep(&self, file_path: Option<&PathBuf>) -> io::Result<PreppedPlugin> {
+        let mut cmd = Command::new(&self.path);
+        let mut args = self.args.clone().unwrap_or(Vec::new());
+        let input_type = self.input.unwrap_or(InputType::file);
+        let output_type = self.output.unwrap_or(OutputType::file);
+        let input_path = match input_type {
+            InputType::stdin => {
+                cmd.stdin(Stdio::piped());
+                InputPath::Stdin
             }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct InputFile {
-    pub path: PathBuf,
-    pub temp: bool,
-}
-
-impl InputFile {
-    pub fn new<T: Into<PathBuf>>(path: T, temp: bool) -> InputFile {
-        InputFile {
-            path: path.into(),
-            temp,
-        }
-    }
-
-    pub fn cleanup(&self) -> io::Result<()> {
-	if self.temp {
-	    fs::remove_file(&self.path)?;
-	}
-	Ok(())
-    }
-}
-
-pub fn prep_process(plugin: &Plugin, input_file: Option<InputFile>) -> PreppedProcess {
-    let mut cmd = Command::new(&plugin.path);
-    let mut args = plugin.args.clone().unwrap_or(Vec::new());
-    let input_type = plugin.input.unwrap_or(InputType::file);
-    let output_type = plugin.output.unwrap_or(OutputType::file);
-    let temp_input_path = match input_type {
-        InputType::stdin => {
-            cmd.stdin(Stdio::piped());
-            None
-        }
-        InputType::file => {
-            cmd.stdin(Stdio::null());
-            let (input_path, temp_path) = if let Some(infile) = &input_file {
-                (Some(&infile.path), None)
-            } else {
-                (None, Some(gen_path().unwrap()))
-            };
-            let path = input_path.or(temp_path.as_ref()).unwrap();
-            cmd.env("INPUT", &path);
-            replace_arg(&mut args, "$INPUT", &path.to_str().unwrap());
-            temp_path
-        }
-    };
-    let output_path = match output_type {
-        OutputType::stdout => None,
-        OutputType::dir => {
-            let path = gen_path().unwrap();
-            cmd.current_dir(&path);
-            Some(path)
-        },
-        OutputType::file => Some(gen_path().unwrap()),
-    };
-    if let Some(path) = &output_path {
-        cmd.env("OUTPUT", path);
-        replace_arg(&mut args, "$OUTPUT", path.to_str().unwrap());
-    }
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    PreppedProcess {
-        command: cmd,
-        temp_input_path,
-        output_path,
-        input_type,
-        output_type,
-        plugin_name: plugin.name.clone(),
-        unpacker: plugin.unpacker.unwrap_or(false),
-        input_file,
+            InputType::file => {
+                cmd.stdin(Stdio::null());
+                let path = file_path.map(|x| x.clone()).unwrap_or(gen_path()?);
+                cmd.env("INPUT", &path);
+                replace_arg(&mut args, "$INPUT", &path.to_str().unwrap());
+                InputPath::File(path)
+            }
+        };
+        let output_path = match output_type {
+            OutputType::stdout => OutputPath::Stdout,
+            OutputType::dir => {
+                let path = gen_path()?;
+                cmd.env("OUTPUT", &path);
+                replace_arg(&mut args, "$OUTPUT", path.to_str().unwrap());
+                cmd.current_dir(&path);
+                OutputPath::Dir(path)
+            }
+            OutputType::file => {
+                let path = gen_path()?;
+                cmd.env("OUTPUT", &path);
+                replace_arg(&mut args, "$OUTPUT", path.to_str().unwrap());
+                OutputPath::File(path)
+            }
+        };
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        Ok(PreppedPlugin {
+            plugin_name: self.name.clone(),
+            command: cmd,
+            input_path,
+            output_path,
+            unpacker: self.unpacker.unwrap_or(false),
+        })
     }
 }
 
@@ -170,12 +86,75 @@ pub fn gen_path() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
+#[allow(non_camel_case_types)]
+pub enum InputType {
+    file,
+    stdin,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
+#[allow(non_camel_case_types)]
+pub enum OutputType {
+    file,
+    dir,
+    stdout,
+}
+
+#[derive(Debug)]
+pub struct PreppedPlugin {
+    pub plugin_name: String,
+    pub command: Command,
+    pub input_path: InputPath,
+    pub output_path: OutputPath,
+    pub unpacker: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum InputPath {
+    File(PathBuf),
+    Stdin,
+}
+
+impl InputPath {
+    pub fn file(&self) -> Option<&PathBuf> {
+        match self {
+            InputPath::File(path) => Some(path),
+            InputPath::Stdin => None,
+        }
+    }
+
+    pub fn stdin(&self) -> bool {
+        self == &InputPath::Stdin
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum OutputPath {
+    Dir(PathBuf),
+    File(PathBuf),
+    Stdout,
+}
+
+impl OutputPath {
+    pub fn dir(&self) -> Option<&PathBuf> {
+        match self {
+            OutputPath::Dir(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn stdout(&self) -> bool {
+        self == &OutputPath::Stdout
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_prep_process() {
+    fn test_prep() {
         let plugin = Plugin {
             name: "foo".into(),
             path: "bar".into(),
@@ -184,21 +163,21 @@ mod tests {
             output: Some(OutputType::stdout),
             unpacker: None,
         };
-        let proc = prep_process(&plugin, None);
+        let prepped = plugin.prep(None).unwrap();
         assert_eq!(
-            proc.input_path(),
-            proc.command
+            Some(&prepped.input_path),
+            prepped.command
                 .get_args()
                 .nth(1)
                 .and_then(|x| x.to_str())
-                .map(PathBuf::from)
+                .map(|x| InputPath::File(PathBuf::from(x)))
                 .as_ref()
         );
-        assert!(proc.output_path.is_none());
-        let proc = prep_process(&plugin, Some(InputFile::new("/foo/bar", true)));
+        assert!(prepped.output_path.stdout());
+        let prepped = plugin.prep(Some(&"/foo/bar".into())).unwrap();
         assert_eq!(
             Some("/foo/bar"),
-            proc.command.get_args().nth(1).and_then(|x| x.to_str())
+            prepped.command.get_args().nth(1).and_then(|x| x.to_str())
         );
     }
 }

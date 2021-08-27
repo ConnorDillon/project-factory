@@ -1,20 +1,26 @@
 #![feature(command_access)]
 
-use getopts::Options;
-use log::debug;
-use process::Input;
-use serde_yaml::from_reader;
-use std::fs::File;
+use std::env;
+use std::fs::{self, File};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
-use std::{env, fs};
+
+use getopts::Options;
+use log::debug;
+use serde_yaml::from_reader;
 use yara::{Compiler, Rules};
 
+use crate::input::{Input, InputData};
 use crate::plugin::Config;
-use crate::process::Global;
+use crate::task::TaskFactory;
+use crate::thread::Pool;
 
+mod input;
+mod output;
 mod plugin;
-mod process;
+mod task;
+mod thread;
+mod walk;
 
 fn main() {
     env_logger::init();
@@ -36,12 +42,12 @@ fn main() {
     }
 }
 
-fn execute<T>(input: Option<PathBuf>, config: Config, rules: Rules, output: T) -> io::Result<()>
+fn execute<E>(input: Option<PathBuf>, config: Config, rules: Rules, exit: E) -> io::Result<()>
 where
-    T: Write + Clone + Send + 'static,
+    E: Write + Clone + Send + 'static,
 {
     let cpus = num_cpus::get();
-    let global = Global::new(config, rules, cpus, cpus * 2);
+    let pool = Pool::new(cpus, cpus * 2, TaskFactory::new(config, rules), exit);
     let input_path = match input {
         Some(p) => Some(fs::canonicalize(p)?),
         None => None,
@@ -51,14 +57,17 @@ where
     env::set_current_dir(&working_dir)?;
     if let Some(path) = input_path {
         if path.is_dir() {
-            process::process_dir(global.clone(), path, false, output)?;
+            walk::walk_dir(path, "".into(), |p, ip| {
+                let inp = Input::new(ip, InputData::File(p, false));
+                pool.process_input(inp);
+            })?;
         } else {
-            process::process_file(global.clone(), path, false, output)?;
+            pool.process_input(Input::new("", InputData::File(path, false)));
         }
     } else {
-        process::process_input(global.clone(), Input::new("", io::stdin()), None, output)?;
+        pool.process_input(Input::new("", InputData::Stdin(io::stdin())));
     }
-    global.join();
+    pool.join();
     env::set_current_dir(&working_dir.parent().unwrap())?;
     fs::remove_dir_all(working_dir).unwrap();
     Ok(())
