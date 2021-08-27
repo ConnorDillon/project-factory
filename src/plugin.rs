@@ -1,9 +1,10 @@
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+use serde::Deserialize;
 
 pub type Config = HashMap<FileType, Plugin>;
 
@@ -166,7 +167,8 @@ mod tests {
         let prepped = plugin.prep(None).unwrap();
         assert_eq!(
             Some(&prepped.input_path),
-            prepped.command
+            prepped
+                .command
                 .get_args()
                 .nth(1)
                 .and_then(|x| x.to_str())

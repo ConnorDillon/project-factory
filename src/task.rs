@@ -8,6 +8,7 @@ use crate::plugin::{Config, FileType, PreppedPlugin};
 
 pub struct Task<T> {
     pub item_path: PathBuf,
+    pub item_type: String,
     pub plugin: PreppedPlugin,
     pub data: T,
 }
@@ -31,16 +32,17 @@ impl TaskFactory {
         let mut buf = Vec::with_capacity(4096);
         (&mut data).take(4096).read_to_end(&mut buf)?;
         match self.get_file_type(&buf) {
-            Some(ftype) => match self.conf.get(&ftype) {
+            Some(item_type) => match self.conf.get(&item_type) {
                 Some(plugin) => {
                     let pplugin = plugin.prep(file_path)?;
                     debug!("Prepped plugin: {:?}", pplugin);
                     info!(
                         "Processing {:?} (type: {}) with {}",
-                        item_path, ftype, pplugin.plugin_name
+                        item_path, item_type, pplugin.plugin_name
                     );
                     Ok(Some(Task {
                         item_path,
+                        item_type,
                         plugin: pplugin,
                         data: Cursor::new(buf).chain(data),
                     }))
@@ -48,7 +50,7 @@ impl TaskFactory {
                 None => {
                     warn!(
                         "File type for {:?} not included in config: {}",
-                        item_path, ftype
+                        item_path, item_type
                     );
                     Ok(None)
                 }

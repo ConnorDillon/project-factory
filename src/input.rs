@@ -91,6 +91,7 @@ where
     let mut child = task.plugin.command.spawn()?;
     output_cb(Output::new(
         task.item_path.clone(),
+        task.item_type.clone(),
         task.plugin.plugin_name.clone(),
         OutputData::Stderr(child.stderr.take().unwrap()),
     ));
@@ -103,6 +104,7 @@ where
         } else {
             output_cb(Output::new(
                 task.item_path.clone(),
+                task.item_type.clone(),
                 task.plugin.plugin_name.clone(),
                 OutputData::Stdout(child.stdout.take().unwrap()),
             ));
@@ -124,8 +126,14 @@ where
                 })?
             } else {
                 let plugin_name = task.plugin.plugin_name;
+                let item_type = task.item_type;
                 walk::walk_dir(path, task.item_path, |p, ip| {
-                    output_cb(Output::new(ip, plugin_name.clone(), OutputData::File(p)));
+                    output_cb(Output::new(
+                        ip,
+                        item_type.clone(),
+                        plugin_name.clone(),
+                        OutputData::File(p),
+                    ));
                 })?
             }
         }
@@ -135,6 +143,7 @@ where
             } else {
                 let output = Output::new(
                     task.item_path,
+                    task.item_type,
                     task.plugin.plugin_name,
                     OutputData::File(path),
                 );
@@ -148,6 +157,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
 
     use std::io::{Cursor, Write};
@@ -169,6 +180,7 @@ mod tests {
         };
         let task = Task {
             item_path: "".into(),
+            item_type: "".into(),
             plugin: plugin.prep(None).unwrap(),
             data: Cursor::new(Vec::from(*b"#!/bin/sh\necho foobar")),
         };
@@ -180,7 +192,11 @@ mod tests {
             task,
         )
         .unwrap();
-        assert_eq!(cur.into_inner(), b"foo:foobar\n");
+        let result: Value = serde_json::from_slice(&cur.into_inner()).unwrap();
+        assert_eq!(
+            result.as_object().unwrap().get("data").unwrap(),
+            &Value::String("foobar".into())
+        );
     }
 
     #[derive(Clone)]
