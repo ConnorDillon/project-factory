@@ -3,13 +3,14 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{ChildStderr, ChildStdout};
 
-use log::error;
+use log::{error, info};
 use serde_json::{Map, Value};
 
 pub static BUFSIZE: usize = 1024 * 1024;
 
 static NEWLINE: u8 = b"\n"[0];
 
+#[derive(Debug)]
 pub struct Output {
     pub item_path: PathBuf,
     pub item_type: String,
@@ -34,13 +35,26 @@ impl Output {
 
     pub fn handle<T: Write>(self, exit: &mut T) -> io::Result<()> {
         match self.data {
-            OutputData::File(path) => copy_output(
-                self.plugin_name,
-                self.item_path,
-                self.item_type,
-                &mut BufReader::with_capacity(BUFSIZE, File::open(path)?),
-                exit,
-            ),
+            OutputData::File(path) => match File::open(&path) {
+                Ok(file) => copy_output(
+                    self.plugin_name,
+                    self.item_path,
+                    self.item_type,
+                    &mut BufReader::with_capacity(BUFSIZE, file),
+                    exit,
+                ),
+                Err(err) => {
+                    if !path.exists() {
+                        error!("Expected output file does not exist {:?}", path);
+                    } else if path.is_dir() {
+                        error!(
+                            "Expected output file is a dir (check output type in config) {:?}",
+                            path
+                        );
+                    }
+                    Err(err)
+                }
+            },
             OutputData::Stdout(out) => copy_output(
                 self.plugin_name,
                 self.item_path,
@@ -48,7 +62,11 @@ impl Output {
                 &mut BufReader::with_capacity(BUFSIZE, out),
                 exit,
             ),
-            OutputData::Stderr(err) => log_output(
+            OutputData::LogStdout(out) => log_output(
+                &mut BufReader::with_capacity(BUFSIZE, out),
+                &self.plugin_name,
+            ),
+            OutputData::LogStderr(err) => log_output(
                 &mut BufReader::with_capacity(BUFSIZE, err),
                 &self.plugin_name,
             ),
@@ -56,16 +74,18 @@ impl Output {
     }
 }
 
+#[derive(Debug)]
 pub enum OutputData {
     File(PathBuf),
     Stdout(ChildStdout),
-    Stderr(ChildStderr),
+    LogStdout(ChildStdout),
+    LogStderr(ChildStderr),
 }
 
 fn log_output<T: BufRead>(output: &mut T, plugin_name: &str) -> io::Result<()> {
     let mut buf = String::new();
     while output.read_line(&mut buf)? > 0 {
-        error!("PLUGIN {}: {}", plugin_name, buf.trim());
+        info!("PLUGIN {}: {}", plugin_name, buf.trim());
         buf.clear();
     }
     Ok(())

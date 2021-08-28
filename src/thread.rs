@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use log::error;
+use log::{debug, error};
 use threadpool::ThreadPool;
 
 use crate::input::Input;
@@ -38,16 +38,18 @@ where
     }
 
     pub fn process_input(&self, input: Input) {
+        let path = input.item_path.clone();
         let is_stdout = input.data.is_stdout();
         let clone = self.clone();
         let job = move || {
+            debug!("Processing {:?}", input);
             let input_cb = |x| clone.process_input(x);
             let output_cb = |x| clone.process_output(x);
             if let Some(err) = input
                 .handle(clone.factory.clone(), &input_cb, &output_cb)
                 .err()
             {
-                error!("{:?}", err)
+                error!("Input thread for {:?} finished with error: {:?}", path, err)
             }
         };
         if is_stdout {
@@ -60,9 +62,15 @@ where
 
     pub fn process_output(&self, output: Output) {
         let mut exit = self.exit.clone();
+        let path = output.item_path.clone();
+        let plugin = output.plugin_name.clone();
         self.out_pool.execute(move || {
+            debug!("Processing {:?}", output);
             if let Some(err) = output.handle(&mut exit).err() {
-                error!("{:?}", err)
+                error!(
+                    "Output thread for {} {:?} finished with error: {:?}",
+                    plugin, path, err
+                )
             }
         })
     }

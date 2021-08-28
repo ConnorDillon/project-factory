@@ -4,11 +4,14 @@ use std::path::PathBuf;
 use std::process::ChildStdout;
 use std::sync::Arc;
 
+use log::debug;
+
 use crate::output::{Output, OutputData, BUFSIZE};
 use crate::plugin::OutputPath;
 use crate::task::{Task, TaskFactory};
 use crate::walk;
 
+#[derive(Debug)]
 pub struct Input {
     pub item_path: PathBuf,
     pub data: InputData,
@@ -53,6 +56,7 @@ impl Input {
     }
 }
 
+#[derive(Debug)]
 pub enum InputData {
     File(PathBuf, bool),
     Stdin(Stdin),
@@ -81,10 +85,13 @@ where
         .map(|x| x.exists())
         .unwrap_or(true);
     if !input_exists {
-        let mut file = File::create(task.plugin.input_path.file().unwrap())?;
+	let path = task.plugin.input_path.file().unwrap();
+        debug!("Creating input file {:?}", path);
+        let mut file = File::create(path)?;
         io::copy(&mut task.data, &mut file)?;
     }
     if let Some(path) = task.plugin.output_path.dir() {
+        debug!("Creating dir {:?}", path);
         fs::create_dir(path)?;
     }
 
@@ -93,22 +100,30 @@ where
         task.item_path.clone(),
         task.item_type.clone(),
         task.plugin.plugin_name.clone(),
-        OutputData::Stderr(child.stderr.take().unwrap()),
+        OutputData::LogStderr(child.stderr.take().unwrap()),
     ));
+    let stdout = child.stdout.take().unwrap();
     if task.plugin.output_path.stdout() {
         if task.plugin.unpacker {
             input_cb(Input::new(
                 task.item_path.clone(),
-                InputData::Stdout(child.stdout.take().unwrap()),
+                InputData::Stdout(stdout),
             ));
         } else {
             output_cb(Output::new(
                 task.item_path.clone(),
                 task.item_type.clone(),
                 task.plugin.plugin_name.clone(),
-                OutputData::Stdout(child.stdout.take().unwrap()),
+                OutputData::Stdout(stdout),
             ));
         }
+    } else {
+        output_cb(Output::new(
+            task.item_path.clone(),
+            task.item_type.clone(),
+            task.plugin.plugin_name.clone(),
+            OutputData::LogStdout(stdout),
+        ));
     }
     if task.plugin.input_path.stdin() {
         io::copy(&mut task.data, child.stdin.as_mut().unwrap())?;
@@ -127,9 +142,10 @@ where
             } else {
                 let plugin_name = task.plugin.plugin_name;
                 let item_type = task.item_type;
-                walk::walk_dir(path, task.item_path, |p, ip| {
+                let item_path = task.item_path;
+                walk::walk_dir(path, item_path.clone(), |p, _| {
                     output_cb(Output::new(
-                        ip,
+                        item_path.clone(),
                         item_type.clone(),
                         plugin_name.clone(),
                         OutputData::File(p),

@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 
+use env_logger::Builder;
 use getopts::Options;
 use log::debug;
 use serde_yaml::from_reader;
@@ -23,7 +24,7 @@ mod thread;
 mod walk;
 
 fn main() {
-    env_logger::init();
+    init_logger();
     let opts = set_opts();
     let args: Vec<String> = env::args().collect();
     let params = read_params(&opts, &args);
@@ -47,9 +48,13 @@ where
     E: Write + Clone + Send + 'static,
 {
     let cpus = num_cpus::get();
-    let pool = Pool::new(cpus, cpus * 2, TaskFactory::new(config, rules), exit);
+    let pool = Pool::new(cpus, cpus * 3, TaskFactory::new(config, rules), exit);
     let input_path = match input {
-        Some(p) => Some(fs::canonicalize(p)?),
+        Some(p) => {
+            let mut path = env::current_dir()?;
+            path.push(p);
+            Some(path)
+        }
         None => None,
     };
     let working_dir = plugin::gen_path()?;
@@ -69,7 +74,7 @@ where
     }
     pool.join();
     env::set_current_dir(&working_dir.parent().unwrap())?;
-    fs::remove_dir_all(working_dir).unwrap();
+    //fs::remove_dir_all(working_dir).unwrap();
     Ok(())
 }
 
@@ -107,6 +112,22 @@ struct Params {
     config: Option<PathBuf>,
     yara: Option<PathBuf>,
     input: Option<PathBuf>,
+}
+
+fn init_logger() {
+    Builder::from_default_env()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {} {} {:?}] {}",
+                buf.timestamp(),
+                record.level(),
+                record.module_path().unwrap_or(""),
+                std::thread::current().id(),
+                record.args()
+            )
+        })
+        .init();
 }
 
 struct Output(Stdout);
