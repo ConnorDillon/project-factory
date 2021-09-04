@@ -1,0 +1,13 @@
+application/gzip:
+  name: gzip
+  path: /usr/bin/gunzip
+  input: stdin
+  output: stdout
+  unpacker: true
+application/x-tar:
+  name: tar
+  path: /usr/bin/tar
+  args: ["-x"]
+  input: stdin
+  output: dir
+  unpacker: true

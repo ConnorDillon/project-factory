@@ -1,0 +1,25 @@
+ntfs/mft:
+  name: mftecmd
+  path: C:\Users\connor\Get-ZimmermanTools\MFTECmd.exe
+  args: ["-f", $INPUT, "--json", $OUTPUT]
+  output: dir
+windows/prefetch:
+  name: pecmd
+  path: C:\Users\connor\Get-ZimmermanTools\PECmd.exe
+  args: ["-f", $INPUT, "--json", $OUTPUT]
+  output: dir
+windows/lnk:
+  name: lecmd
+  path: C:\Users\connor\Get-ZimmermanTools\LECmd.exe
+  args: ["-f", $INPUT, "--json", $OUTPUT]
+  output: dir
+windows/jumplist.automatic_destinations:
+  name: jlecmd
+  path: C:\Users\connor\Get-ZimmermanTools\JLECmd.exe
+  args: ["-f", $INPUT, "--json", $OUTPUT]
+  output: dir
+windows/jumplist.custom_destinations:
+  name: jlecmd
+  path: C:\Users\connor\Get-ZimmermanTools\JLECmd.exe
+  args: ["-f", $INPUT, "--json", $OUTPUT]
+  output: dir
