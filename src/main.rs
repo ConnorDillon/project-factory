@@ -1,4 +1,4 @@
-#![feature(command_access)]
+#![feature(command_access, thread_id_value)]
 
 use std::env;
 use std::fs::{self, File};
@@ -11,15 +11,15 @@ use log::debug;
 use serde_yaml::from_reader;
 use yara::{Compiler, Rules};
 
-use crate::input::{Input, InputData};
+use crate::input::InputData;
 use crate::plugin::Config;
-use crate::task::TaskFactory;
+use crate::pre_process::PreProcessor;
 use crate::thread::Pool;
 
 mod input;
 mod output;
 mod plugin;
-mod task;
+mod pre_process;
 mod thread;
 mod walk;
 
@@ -48,7 +48,7 @@ where
     E: Write + Clone + Send + 'static,
 {
     let cpus = num_cpus::get();
-    let pool = Pool::new(cpus, cpus * 3, TaskFactory::new(config, rules), exit);
+    let pool = Pool::new(cpus, cpus * 10, PreProcessor::new(config, rules), exit);
     let input_path = match input {
         Some(p) => {
             let mut path = env::current_dir()?;
@@ -63,18 +63,18 @@ where
     if let Some(path) = input_path {
         if path.is_dir() {
             walk::walk_dir(path, "".into(), |p, ip| {
-                let inp = Input::new(ip, InputData::File(p, false));
+                let inp = pool.factory.new_input(ip, InputData::File(p, false));
                 pool.process_input(inp);
             })?;
         } else {
-            pool.process_input(Input::new("", InputData::File(path, false)));
+            pool.process_input(pool.factory.new_input("", InputData::File(path, false)));
         }
     } else {
-        pool.process_input(Input::new("", InputData::Stdin(io::stdin())));
+        pool.process_input(pool.factory.new_input("", InputData::Stdin(io::stdin())));
     }
     pool.join();
     env::set_current_dir(&working_dir.parent().unwrap())?;
-    //fs::remove_dir_all(working_dir).unwrap();
+    fs::remove_dir_all(working_dir).unwrap();
     Ok(())
 }
 
@@ -119,11 +119,10 @@ fn init_logger() {
         .format(|buf, record| {
             writeln!(
                 buf,
-                "[{} {} {} {:?}] {}",
+                "[{} {} Thread({})] {}",
                 buf.timestamp(),
                 record.level(),
-                record.module_path().unwrap_or(""),
-                std::thread::current().id(),
+                std::thread::current().id().as_u64(),
                 record.args()
             )
         })

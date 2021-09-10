@@ -1,7 +1,9 @@
+use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{ChildStderr, ChildStdout};
+use std::thread::{self, ThreadId};
 
 use log::{error, info};
 use serde_json::{Map, Value};
@@ -10,8 +12,24 @@ pub static BUFSIZE: usize = 1024 * 1024;
 
 static NEWLINE: u8 = b"\n"[0];
 
+#[derive(Copy, Clone, Debug)]
+pub struct TaskId(ThreadId, u64);
+
+impl TaskId {
+    pub fn new(id: u64) -> TaskId {
+        TaskId(thread::current().id(), id)
+    }
+}
+
+impl Display for TaskId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Task({}.{})", self.0.as_u64(), self.1)
+    }
+}
+
 #[derive(Debug)]
 pub struct Output {
+    pub task_id: TaskId,
     pub item_path: PathBuf,
     pub item_type: String,
     pub plugin_name: String,
@@ -20,12 +38,14 @@ pub struct Output {
 
 impl Output {
     pub fn new<P: Into<PathBuf>, S: Into<String>>(
+        task_id: TaskId,
         item_path: P,
         item_type: S,
         plugin_name: S,
         data: OutputData,
     ) -> Output {
         Output {
+            task_id,
             item_path: item_path.into(),
             item_type: item_type.into(),
             plugin_name: plugin_name.into(),
@@ -45,11 +65,14 @@ impl Output {
                 ),
                 Err(err) => {
                     if !path.exists() {
-                        error!("Expected output file does not exist {:?}", path);
+                        error!(
+                            "{}: Expected output file does not exist {:?}",
+                            self.task_id, path
+                        );
                     } else if path.is_dir() {
                         error!(
-                            "Expected output file is a dir (check output type in config) {:?}",
-                            path
+                            "{}: Expected output file is a dir (check output type in config) {:?}",
+                            self.task_id, path
                         );
                     }
                     Err(err)

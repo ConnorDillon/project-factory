@@ -2,53 +2,78 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Stdin};
 use std::path::PathBuf;
 use std::process::ChildStdout;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use log::debug;
 
-use crate::output::{Output, OutputData, BUFSIZE};
+use crate::output::{Output, OutputData, TaskId, BUFSIZE};
 use crate::plugin::OutputPath;
-use crate::task::{Task, TaskFactory};
+use crate::pre_process::{PreProcessedInput, PreProcessor};
 use crate::walk;
+
+pub struct InputFactory {
+    pub last_id: AtomicU64,
+}
+
+impl InputFactory {
+    pub fn new() -> InputFactory {
+        InputFactory {
+            last_id: AtomicU64::new(0),
+        }
+    }
+
+    pub fn new_input<P: Into<PathBuf>>(&self, item_path: P, data: InputData) -> Input {
+        Input {
+            task_id: TaskId::new(self.last_id.fetch_add(1, Ordering::Relaxed)),
+            item_path: item_path.into(),
+            data,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Input {
+    pub task_id: TaskId,
     pub item_path: PathBuf,
     pub data: InputData,
 }
 
 impl Input {
-    pub fn new<P: Into<PathBuf>>(item_path: P, data: InputData) -> Input {
-        Input {
-            item_path: item_path.into(),
-            data,
-        }
-    }
-
     pub fn handle<I: Fn(Input), O: Fn(Output)>(
         self,
-        factory: Arc<TaskFactory>,
+        factory: Arc<InputFactory>,
+        pre_processor: Arc<PreProcessor>,
         input_cb: &I,
         output_cb: &O,
     ) -> io::Result<()> {
         match self.data {
             InputData::File(path, temp) => {
                 let file_buf = BufReader::with_capacity(BUFSIZE, File::open(&path)?);
-                if let Some(task) = factory.new_task(self.item_path, Some(&path), file_buf)? {
-                    run_task(input_cb, output_cb, task)?;
+                if let Some(ppi) = pre_processor.pre_process(
+                    self.task_id,
+                    self.item_path,
+                    Some(&path),
+                    file_buf,
+                )? {
+                    run_task(input_cb, output_cb, factory, ppi)?;
                 }
                 if temp {
                     fs::remove_file(path)?;
                 }
             }
             InputData::Stdin(stdin) => {
-                if let Some(task) = factory.new_task(self.item_path, None, stdin)? {
-                    run_task(input_cb, output_cb, task)?;
+                if let Some(ppi) =
+                    pre_processor.pre_process(self.task_id, self.item_path, None, stdin)?
+                {
+                    run_task(input_cb, output_cb, factory, ppi)?;
                 }
             }
             InputData::Stdout(stdout) => {
-                if let Some(task) = factory.new_task(self.item_path, None, stdout)? {
-                    run_task(input_cb, output_cb, task)?;
+                if let Some(ppi) =
+                    pre_processor.pre_process(self.task_id, self.item_path, None, stdout)?
+                {
+                    run_task(input_cb, output_cb, factory, ppi)?;
                 }
             }
         }
@@ -72,79 +97,88 @@ impl InputData {
     }
 }
 
-fn run_task<I, O, R>(input_cb: &I, output_cb: &O, mut task: Task<R>) -> io::Result<()>
+fn run_task<I, O, R>(
+    input_cb: &I,
+    output_cb: &O,
+    factory: Arc<InputFactory>,
+    mut ppi: PreProcessedInput<R>,
+) -> io::Result<()>
 where
     I: Fn(Input),
     O: Fn(Output),
     R: Read,
 {
-    let input_exists = task
+    let input_exists = ppi
         .plugin
         .input_path
         .file()
         .map(|x| x.exists())
         .unwrap_or(true);
     if !input_exists {
-	let path = task.plugin.input_path.file().unwrap();
-        debug!("Creating input file {:?}", path);
+        let path = ppi.plugin.input_path.file().unwrap();
+        debug!("{}: Creating input file {:?}", ppi.task_id, path);
         let mut file = File::create(path)?;
-        io::copy(&mut task.data, &mut file)?;
+        io::copy(&mut ppi.data, &mut file)?;
     }
-    if let Some(path) = task.plugin.output_path.dir() {
-        debug!("Creating dir {:?}", path);
+    if let Some(path) = ppi.plugin.output_path.dir() {
+        debug!("{}: Creating dir {:?}", ppi.task_id, path);
         fs::create_dir(path)?;
     }
 
-    let mut child = task.plugin.command.spawn()?;
+    let mut child = ppi.plugin.command.spawn()?;
     output_cb(Output::new(
-        task.item_path.clone(),
-        task.item_type.clone(),
-        task.plugin.plugin_name.clone(),
+        ppi.task_id,
+        ppi.item_path.clone(),
+        ppi.item_type.clone(),
+        ppi.plugin.plugin_name.clone(),
         OutputData::LogStderr(child.stderr.take().unwrap()),
     ));
     let stdout = child.stdout.take().unwrap();
-    if task.plugin.output_path.stdout() {
-        if task.plugin.unpacker {
-            input_cb(Input::new(
-                task.item_path.clone(),
-                InputData::Stdout(stdout),
-            ));
+    if ppi.plugin.output_path.stdout() {
+        if ppi.plugin.unpacker {
+            input_cb(factory.new_input(ppi.item_path.clone(), InputData::Stdout(stdout)));
         } else {
             output_cb(Output::new(
-                task.item_path.clone(),
-                task.item_type.clone(),
-                task.plugin.plugin_name.clone(),
+                ppi.task_id,
+                ppi.item_path.clone(),
+                ppi.item_type.clone(),
+                ppi.plugin.plugin_name.clone(),
                 OutputData::Stdout(stdout),
             ));
         }
     } else {
         output_cb(Output::new(
-            task.item_path.clone(),
-            task.item_type.clone(),
-            task.plugin.plugin_name.clone(),
+            ppi.task_id,
+            ppi.item_path.clone(),
+            ppi.item_type.clone(),
+            ppi.plugin.plugin_name.clone(),
             OutputData::LogStdout(stdout),
         ));
     }
-    if task.plugin.input_path.stdin() {
-        io::copy(&mut task.data, child.stdin.as_mut().unwrap())?;
+    if ppi.plugin.input_path.stdin() {
+        debug!("{}: Copy task data to child stdin", ppi.task_id);
+        io::copy(&mut ppi.data, child.stdin.as_mut().unwrap())?;
     }
     child.wait()?;
+    debug!("{}: FINISH CHILD PROCESS", ppi.task_id);
 
     if !input_exists {
-        fs::remove_file(task.plugin.input_path.file().unwrap())?;
+        fs::remove_file(ppi.plugin.input_path.file().unwrap())?;
     }
-    match task.plugin.output_path {
+    match ppi.plugin.output_path {
         OutputPath::Dir(path) => {
-            if task.plugin.unpacker {
-                walk::walk_dir(path, task.item_path, |p, ip| {
-                    input_cb(Input::new(ip, InputData::File(p, true)));
+            if ppi.plugin.unpacker {
+                walk::walk_dir(path, ppi.item_path, |p, ip| {
+                    input_cb(factory.new_input(ip, InputData::File(p, true)));
                 })?
             } else {
-                let plugin_name = task.plugin.plugin_name;
-                let item_type = task.item_type;
-                let item_path = task.item_path;
+                let task_id = ppi.task_id;
+                let plugin_name = ppi.plugin.plugin_name;
+                let item_type = ppi.item_type;
+                let item_path = ppi.item_path;
                 walk::walk_dir(path, item_path.clone(), |p, _| {
                     output_cb(Output::new(
+                        task_id,
                         item_path.clone(),
                         item_type.clone(),
                         plugin_name.clone(),
@@ -154,13 +188,14 @@ where
             }
         }
         OutputPath::File(path) => {
-            if task.plugin.unpacker {
-                input_cb(Input::new(task.item_path, InputData::File(path, true)));
+            if ppi.plugin.unpacker {
+                input_cb(factory.new_input(ppi.item_path, InputData::File(path, true)));
             } else {
                 let output = Output::new(
-                    task.item_path,
-                    task.item_type,
-                    task.plugin.plugin_name,
+                    ppi.task_id,
+                    ppi.item_path,
+                    ppi.item_type,
+                    ppi.plugin.plugin_name,
                     OutputData::File(path),
                 );
                 output_cb(output);
@@ -186,6 +221,7 @@ mod tests {
 
     #[test]
     fn test_run_task() {
+        let factory = Arc::new(InputFactory::new());
         let plugin = Plugin {
             name: "foo".into(),
             path: "/bin/sh".into(),
@@ -194,7 +230,8 @@ mod tests {
             output: Some(OutputType::stdout),
             unpacker: None,
         };
-        let task = Task {
+        let task = PreProcessedInput {
+            task_id: TaskId::new(0),
             item_path: "".into(),
             item_type: "".into(),
             plugin: plugin.prep(None).unwrap(),
@@ -205,6 +242,7 @@ mod tests {
         run_task(
             &drop,
             &move |x| x.handle(&mut cur_clone.clone()).unwrap(),
+            factory,
             task,
         )
         .unwrap();
