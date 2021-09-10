@@ -11,3 +11,8 @@ application/x-tar:
   input: stdin
   output: dir
   unpacker: true
+application/syslog:
+  name: cat
+  path: /bin/cat
+  input: stdin
+  output: stdout

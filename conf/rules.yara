@@ -43,3 +43,10 @@ rule JumpListCustomDestinations {
         $lnk_header = { 4C 00 00 00 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46 }
     condition: $cd_header at 0 and $lnk_header in ( 8..4096 )
 }
+
+rule Syslog {
+  meta: type = "application/syslog"
+  strings: $sig =
+  /\S+\s+[0-9]{1,2}\s+[0-9]+:[0-9]+:[0-9]+\s+\S+\s+\S+\[[0-9]+\]\s?\S*:/
+  condition: $sig at 0
+}
