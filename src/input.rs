@@ -43,7 +43,7 @@ impl Input {
     pub fn handle<I: Fn(Input), O: Fn(Output)>(
         self,
         factory: Arc<InputFactory>,
-        pre_processor: Arc<PreProcessor>,
+        pre_processor: &PreProcessor,
         input_cb: &I,
         output_cb: &O,
     ) -> io::Result<()> {

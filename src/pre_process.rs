@@ -1,9 +1,9 @@
 use std::io::{self, Chain, Cursor, Read};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use log::{debug, info, warn};
-use yara::{Metadata, MetadataValue, Rules};
+use yara::{Compiler, Metadata, MetadataValue, Rules};
 
 use crate::output::TaskId;
 use crate::plugin::{Config, FileType, PreppedPlugin};
@@ -17,15 +17,20 @@ pub struct PreProcessedInput<T> {
 }
 
 pub struct PreProcessor {
-    pub conf: Config,
-    pub rules: Mutex<Rules>,
+    pub config: Arc<Config>,
+    pub rules_str: Arc<String>,
+    pub rules: Rules,
 }
 
 impl PreProcessor {
-    pub fn new(conf: Config, rules: Rules) -> PreProcessor {
+    pub fn new(config: Arc<Config>, rules_str: Arc<String>) -> PreProcessor {
+        let mut comp = Compiler::new().unwrap();
+        comp.add_rules_str(&rules_str).unwrap();
+        let rules = comp.compile_rules().unwrap();
         PreProcessor {
-            conf,
-            rules: Mutex::new(rules),
+            config,
+            rules_str,
+            rules,
         }
     }
 
@@ -40,7 +45,7 @@ impl PreProcessor {
         (&mut data).take(4096).read_to_end(&mut buf)?;
         let get_file_type = self.get_file_type(&buf);
         match get_file_type {
-            Some(item_type) => match self.conf.get(&item_type) {
+            Some(item_type) => match self.config.get(&item_type) {
                 Some(plugin) => {
                     let pplugin = plugin.prep(file_path)?;
                     debug!("{}: Prepped plugin: {:?}", task_id, pplugin);
@@ -76,8 +81,6 @@ impl PreProcessor {
 
     fn get_file_type(&self, head: &[u8]) -> Option<FileType> {
         self.rules
-            .lock()
-            .unwrap()
             .scan_mem(head, u16::MAX)
             .unwrap()
             .iter()

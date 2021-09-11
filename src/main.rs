@@ -2,24 +2,23 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Stdout, Write};
+use std::io::{self, Read, Stdout, Write};
 use std::path::PathBuf;
 
 use env_logger::Builder;
 use getopts::Options;
 use log::debug;
 use serde_yaml::from_reader;
-use yara::{Compiler, Rules};
 
 use crate::input::InputData;
 use crate::plugin::Config;
-use crate::pre_process::PreProcessor;
 use crate::thread::Pool;
 
 mod input;
 mod output;
 mod plugin;
 mod pre_process;
+#[allow(dead_code)]
 mod thread;
 mod walk;
 
@@ -34,21 +33,28 @@ fn main() {
         let cfile = File::open(cpath).unwrap();
         let conf: Config = from_reader(cfile).unwrap();
         debug!("Config: {:?}", conf);
-        let mut compiler = Compiler::new().unwrap();
-        compiler.add_rules_file(ypath).unwrap();
-        let rules = compiler.compile_rules().unwrap();
+        let mut rules = String::new();
+        File::open(ypath)
+            .unwrap()
+            .read_to_string(&mut rules)
+            .unwrap();
+        //let mut compiler = Compiler::new().unwrap();
+        //compiler.add_rules_file(ypath).unwrap();
+        //let rules = compiler.compile_rules().unwrap();
         execute(params.input, conf, rules, Output(io::stdout())).unwrap();
     } else {
         print!("{}", opts.usage("Usage: factory [options]"));
     }
 }
 
-fn execute<E>(input: Option<PathBuf>, config: Config, rules: Rules, exit: E) -> io::Result<()>
+fn execute<E>(input: Option<PathBuf>, config: Config, rules: String, exit: E) -> io::Result<()>
 where
     E: Write + Clone + Send + 'static,
 {
     let cpus = num_cpus::get();
-    let pool = Pool::new(cpus, cpus * 10, PreProcessor::new(config, rules), exit);
+    let mut pool = Pool::new(config, rules, exit);
+    pool.add_input_threads(cpus);
+    pool.add_output_threads(cpus * 2);
     let input_path = match input {
         Some(p) => {
             let mut path = env::current_dir()?;
@@ -64,15 +70,19 @@ where
         if path.is_dir() {
             walk::walk_dir(path, "".into(), |p, ip| {
                 let inp = pool.factory.new_input(ip, InputData::File(p, false));
-                pool.process_input(inp);
+                pool.input_sender.send(inp).unwrap();
             })?;
         } else {
-            pool.process_input(pool.factory.new_input("", InputData::File(path, false)));
+            pool.input_sender
+                .send(pool.factory.new_input("", InputData::File(path, false)))
+                .unwrap();
         }
     } else {
-        pool.process_input(pool.factory.new_input("", InputData::Stdin(io::stdin())));
+        pool.input_sender
+            .send(pool.factory.new_input("", InputData::Stdin(io::stdin())))
+            .unwrap();
     }
-    pool.join();
+    pool.join().unwrap();
     env::set_current_dir(&working_dir.parent().unwrap())?;
     fs::remove_dir_all(working_dir).unwrap();
     Ok(())
