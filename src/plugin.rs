@@ -6,11 +6,29 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-pub type Config = HashMap<FileType, Plugin>;
+pub type Config = HashMap<FileType, Settings>;
 
 pub type FileType = String;
 
 #[derive(Debug, Deserialize)]
+pub struct Settings {
+    pub header: Header,
+    pub plugin: Plugin,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Header {
+    pub regex: String,
+    pub hex: Option<bool>,
+}
+
+impl Header {
+    pub fn is_hex(&self) -> bool {
+	self.hex.is_some() && self.hex.unwrap()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct Plugin {
     pub name: String,
     pub path: PathBuf,

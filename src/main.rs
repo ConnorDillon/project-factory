@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read, Stdout, Write};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 
 use env_logger::Builder;
@@ -18,7 +18,6 @@ mod input;
 mod output;
 mod plugin;
 mod pre_process;
-#[allow(dead_code)]
 mod thread;
 mod walk;
 
@@ -29,30 +28,22 @@ fn main() {
     let params = read_params(&opts, &args);
     if params.help {
         print!("{}", opts.usage("Usage: factory [options]"));
-    } else if let (Some(cpath), Some(ypath)) = (params.config, params.yara) {
+    } else if let Some(cpath) = params.config {
         let cfile = File::open(cpath).unwrap();
         let conf: Config = from_reader(cfile).unwrap();
         debug!("Config: {:?}", conf);
-        let mut rules = String::new();
-        File::open(ypath)
-            .unwrap()
-            .read_to_string(&mut rules)
-            .unwrap();
-        //let mut compiler = Compiler::new().unwrap();
-        //compiler.add_rules_file(ypath).unwrap();
-        //let rules = compiler.compile_rules().unwrap();
-        execute(params.input, conf, rules, Output(io::stdout())).unwrap();
+        execute(params.input, conf, Output(io::stdout())).unwrap();
     } else {
         print!("{}", opts.usage("Usage: factory [options]"));
     }
 }
 
-fn execute<E>(input: Option<PathBuf>, config: Config, rules: String, exit: E) -> io::Result<()>
+fn execute<E>(input: Option<PathBuf>, config: Config, exit: E) -> io::Result<()>
 where
     E: Write + Clone + Send + 'static,
 {
     let cpus = num_cpus::get();
-    let mut pool = Pool::new(config, rules, exit);
+    let mut pool = Pool::new(config, exit);
     pool.add_input_threads(cpus);
     pool.add_output_threads(cpus * 2);
     let input_path = match input {
@@ -112,7 +103,6 @@ fn read_params(opts: &Options, args: &Vec<String>) -> Params {
     Params {
         help: matches.opt_present("help"),
         config: matches.opt_get("config").unwrap(),
-        yara: matches.opt_get("yara").unwrap(),
         input: matches.opt_get("input").unwrap(),
     }
 }
@@ -120,7 +110,6 @@ fn read_params(opts: &Options, args: &Vec<String>) -> Params {
 struct Params {
     help: bool,
     config: Option<PathBuf>,
-    yara: Option<PathBuf>,
     input: Option<PathBuf>,
 }
 

@@ -3,7 +3,6 @@ use std::io::{self, BufReader, Read, Stdin};
 use std::path::PathBuf;
 use std::process::ChildStdout;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use log::debug;
 
@@ -42,10 +41,10 @@ pub struct Input {
 impl Input {
     pub fn handle<I: Fn(Input), O: Fn(Output)>(
         self,
-        factory: Arc<InputFactory>,
+        factory: &InputFactory,
         pre_processor: &PreProcessor,
-        input_cb: &I,
-        output_cb: &O,
+        input_cb: I,
+        output_cb: O,
     ) -> io::Result<()> {
         match self.data {
             InputData::File(path, temp) => {
@@ -98,9 +97,9 @@ impl InputData {
 }
 
 fn run_task<I, O, R>(
-    input_cb: &I,
-    output_cb: &O,
-    factory: Arc<InputFactory>,
+    input_cb: I,
+    output_cb: O,
+    factory: &InputFactory,
     mut ppi: PreProcessedInput<R>,
 ) -> io::Result<()>
 where
@@ -208,20 +207,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
     use super::*;
 
     use std::io::{Cursor, Write};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
+
+    use serde_json::Value;
 
     use crate::plugin::{OutputType, Plugin};
 
     #[test]
     fn test_run_task() {
-        let factory = Arc::new(InputFactory::new());
+        let factory = InputFactory::new();
         let plugin = Plugin {
             name: "foo".into(),
             path: "/bin/sh".into(),
@@ -241,8 +241,8 @@ mod tests {
         let cur_clone = cur.clone();
         run_task(
             &drop,
-            &move |x| x.handle(&mut cur_clone.clone()).unwrap(),
-            factory,
+            move |x| x.handle(&mut cur_clone.clone()).unwrap(),
+            &factory,
             task,
         )
         .unwrap();

@@ -1,12 +1,13 @@
+use std::collections::HashMap;
+use std::fmt::Write;
 use std::io::{self, Chain, Cursor, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use log::{debug, info, warn};
-use yara::{Compiler, Metadata, MetadataValue, Rules};
+use regex::Regex;
 
 use crate::output::TaskId;
-use crate::plugin::{Config, FileType, PreppedPlugin};
+use crate::plugin::{Config, FileType, Plugin, PreppedPlugin};
 
 pub struct PreProcessedInput<T> {
     pub task_id: TaskId,
@@ -17,20 +18,34 @@ pub struct PreProcessedInput<T> {
 }
 
 pub struct PreProcessor {
-    pub config: Arc<Config>,
-    pub rules_str: Arc<String>,
-    pub rules: Rules,
+    pub plugins: HashMap<FileType, Plugin>,
+    pub compiled: HashMap<FileType, Regex>,
+    pub compiled_hex: HashMap<FileType, Regex>,
 }
 
 impl PreProcessor {
-    pub fn new(config: Arc<Config>, rules_str: Arc<String>) -> PreProcessor {
-        let mut comp = Compiler::new().unwrap();
-        comp.add_rules_str(&rules_str).unwrap();
-        let rules = comp.compile_rules().unwrap();
+    pub fn new(config: &Config) -> PreProcessor {
+        let compiled = config
+            .iter()
+            .filter(|(_, s)| !s.header.is_hex())
+            .map(|(t, s)| (t.clone(), Regex::new(&s.header.regex).unwrap()))
+            .collect();
+        let compiled_hex = config
+            .iter()
+            .filter(|(_, s)| s.header.is_hex())
+            .map(|(t, s)| {
+                let mut re = s.header.regex.replace(" ", "");
+                re.make_ascii_uppercase();
+                (t.clone(), Regex::new(&re).unwrap())
+            })
+            .collect();
         PreProcessor {
-            config,
-            rules_str,
-            rules,
+            plugins: config
+                .iter()
+                .map(|(t, s)| (t.clone(), s.plugin.clone()))
+                .collect(),
+            compiled,
+            compiled_hex,
         }
     }
 
@@ -43,9 +58,8 @@ impl PreProcessor {
     ) -> io::Result<Option<PreProcessedInput<Chain<Cursor<Vec<u8>>, R>>>> {
         let mut buf = Vec::with_capacity(4096);
         (&mut data).take(4096).read_to_end(&mut buf)?;
-        let get_file_type = self.get_file_type(&buf);
-        match get_file_type {
-            Some(item_type) => match self.config.get(&item_type) {
+        match self.get_file_type(&buf) {
+            Some(item_type) => match self.plugins.get(&item_type) {
                 Some(plugin) => {
                     let pplugin = plugin.prep(file_path)?;
                     debug!("{}: Prepped plugin: {:?}", task_id, pplugin);
@@ -80,25 +94,81 @@ impl PreProcessor {
     }
 
     fn get_file_type(&self, head: &[u8]) -> Option<FileType> {
-        self.rules
-            .scan_mem(head, u16::MAX)
-            .unwrap()
-            .iter()
-            .next()
-            .map(|x| {
-                x.metadatas
-                    .iter()
-                    .filter(|x| x.identifier == "type")
-                    .next()
-                    .and_then(meta_string)
-                    .unwrap()
-            })
+        let head_str = String::from_utf8_lossy(head);
+        for (t, r) in self.compiled.iter() {
+            if r.is_match(&head_str) {
+                return Some(t.clone());
+            }
+        }
+        let mut head_hex = String::with_capacity(head.len() * 2);
+        for byte in head {
+            write!(head_hex, "{:02X}", byte).unwrap();
+        }
+        for (t, r) in self.compiled_hex.iter() {
+            if r.is_match(&head_hex) {
+                return Some(t.clone());
+            }
+        }
+        None
     }
 }
 
-fn meta_string(meta: &Metadata) -> Option<String> {
-    match meta.value {
-        MetadataValue::String(x) => Some(x.into()),
-        _ => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::plugin::{Header, Plugin, Settings};
+
+    fn empty_plugin() -> Plugin {
+        Plugin {
+            name: "".into(),
+            path: "".into(),
+            args: None,
+            input: None,
+            output: None,
+            unpacker: None,
+        }
+    }
+
+    #[test]
+    fn test_get_file_type() {
+        let conf = vec![(
+            "foo".into(),
+            Settings {
+                header: Header {
+                    regex: "^.FOO".into(),
+                    hex: None,
+                },
+                plugin: empty_plugin(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let pp = PreProcessor::new(&conf);
+        assert_eq!(
+            pp.get_file_type(&[0x8b, 0x46, 0x4f, 0x4f, 0x8b]),
+            Some("foo".into())
+        );
+    }
+
+    #[test]
+    fn test_get_file_type_hex() {
+        let conf = vec![(
+            "bar".into(),
+            Settings {
+                header: Header {
+                    regex: "^8B 00 .. 4f4F$".into(),
+                    hex: Some(true),
+                },
+                plugin: empty_plugin(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let pp = PreProcessor::new(&conf);
+        assert_eq!(
+            pp.get_file_type(&[0x8b, 0x00, 0x46, 0x4f, 0x4f]),
+            Some("bar".into())
+        );
     }
 }

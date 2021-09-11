@@ -1,25 +1,44 @@
 ntfs/mft:
-  name: mftecmd
-  path: C:\Users\connor\Get-ZimmermanTools\MFTECmd.exe
-  args: ["-f", $INPUT, "--json", $OUTPUT]
-  output: dir
+  header:
+    regex: ^FILE
+  plugin:
+    name: mftecmd
+    path: C:\Users\connor\Get-ZimmermanTools\MFTECmd.exe
+    args: ["-f", $INPUT, "--json", $OUTPUT]
+    output: dir
 windows/prefetch:
-  name: pecmd
-  path: C:\Users\connor\Get-ZimmermanTools\PECmd.exe
-  args: ["-f", $INPUT, "--json", $OUTPUT]
-  output: dir
+  header:
+    regex: ^4D 41 4D 04
+    hex: true
+  plugin:
+    name: pecmd
+    path: C:\Users\connor\Get-ZimmermanTools\PECmd.exe
+    args: ["-f", $INPUT, "--json", $OUTPUT]
+    output: dir
 windows/lnk:
-  name: lecmd
-  path: C:\Users\connor\Get-ZimmermanTools\LECmd.exe
-  args: ["-f", $INPUT, "--json", $OUTPUT]
-  output: dir
+  header:
+    regex: ^4C 00 00 00 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46
+    hex: true
+  plugin:
+    name: lecmd
+    path: C:\Users\connor\Get-ZimmermanTools\LECmd.exe
+    args: ["-f", $INPUT, "--json", $OUTPUT]
+    output: dir
 windows/jumplist.automatic_destinations:
-  name: jlecmd
-  path: C:\Users\connor\Get-ZimmermanTools\JLECmd.exe
-  args: ["-f", $INPUT, "--json", $OUTPUT]
-  output: dir
+  header:
+    regex: ^d0 cf 11 e0 a1 b1 1a e1 .* 4C 00 00 00 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46
+    hex: true
+  plugin:
+    name: jlecmd
+    path: C:\Users\connor\Get-ZimmermanTools\JLECmd.exe
+    args: ["-f", $INPUT, "--json", $OUTPUT]
+    output: dir
 windows/jumplist.custom_destinations:
-  name: jlecmd
-  path: C:\Users\connor\Get-ZimmermanTools\JLECmd.exe
-  args: ["-f", $INPUT, "--json", $OUTPUT]
-  output: dir
+  header:
+    regex: ^02 00 00 00 ( 01 | 02 ) 00 00 00 .* 4C 00 00 00 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46
+    hex: true
+  plugin:
+    name: jlecmd
+    path: C:\Users\connor\Get-ZimmermanTools\JLECmd.exe
+    args: ["-f", $INPUT, "--json", $OUTPUT]
+    output: dir
