@@ -26,7 +26,7 @@ windows/lnk:
     output: dir
 windows/jumplist.automatic_destinations:
   header:
-    regex: ^d0 cf 11 e0 a1 b1 1a e1 .* 4C 00 00 00 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46
+    regex: ^D0 cf 11 E0 A1 B1 1A E1 .* 4C 00 00 00 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46
     hex: true
   plugin:
     name: jlecmd
