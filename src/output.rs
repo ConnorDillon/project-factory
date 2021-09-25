@@ -129,10 +129,10 @@ fn copy_output<T: BufRead, U: Write>(
     map.insert("type".into(), item_type.into());
     let mut line = Value::Object(map);
     while output.read_line(&mut in_buf)? > 0 {
-        in_buf.pop();
-        let data = match serde_json::from_str(&in_buf) {
-            Ok(x) => Value::Object(x),
-            Err(_) => Value::String(in_buf.clone()),
+	let s = in_buf.trim_end();
+        let data = match serde_json::from_str(s) {
+            Ok(x) => x,
+            Err(_) => Value::String(s.to_string()),
         };
         line.as_object_mut().unwrap().insert("data".into(), data);
         serde_json::to_writer(&mut out_buf, &line)?;
