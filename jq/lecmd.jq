@@ -10,6 +10,7 @@ def lnk_events:
         catch null
       )
     , path: .lnk.local_path
+    , size: .lnk.file_size
     }
   , log: {file: {path: .file.path}}
   , event:
@@ -33,7 +34,7 @@ def transform:
     , drive_type: .data.DriveType
     , extrab_locks_present: .data.ExtraBlocksPresent
     , file_attributes: .data.FileAttributes
-    , files_ize: .data.FileSize
+    , file_size: .data.FileSize
     , header_flags: .data.HeaderFlags
     , mac_vendor: .data.MACVendor
     , machine_id: .data.MachineID
