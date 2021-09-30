@@ -2,12 +2,12 @@ import "lecmd" as lecmd;
 
 def timestamp:
   try
-    ( sub("\\/Date\\((?<x>-?.{10}).*"; "\(.x)") |
-      ( if startswith("-")
-        then null
-        else tonumber | strftime("%Y-%m-%dT%H:%M:%SZ")
-        end
-      )
+    ( sub("\\/Date\\((?<x>-?.{10}).*"; "\(.x)")
+      | ( if startswith("-")
+          then null
+          else tonumber | strftime("%Y-%m-%dT%H:%M:%SZ")
+          end
+        )
     )
   catch
     null
@@ -30,37 +30,37 @@ def lnk:
 ;
 
 def custom_destinations:
-  . as $x |
-  .data.Entries[] as $e |
-  $e.LnkFiles[] |
-  { jumplist:
-    { app_id: $x.data.AppId.Description
-    , rank: $e.Rank
-    , name: $e.Name
+  . as $x
+  | .data.Entries[] as $e
+  | $e.LnkFiles[]
+  | { jumplist:
+      { app_id: $x.data.AppId.Description
+      , rank: $e.Rank
+      , name: $e.Name
+      }
+    , lnk: (. | lnk)
     }
-  , lnk: (. | lnk)
-  }
 ;
 
 def automatic_destinations:
-  . as $x |
-  .data.DestListEntries[] |
-  { jumplist:
-    { app_id: $x.data.AppId.Description
-    , path: .Path
-    , created_on: .CreatedOn | timestamp
+  . as $x
+  | .data.DestListEntries[]
+  | { jumplist:
+      { app_id: $x.data.AppId.Description
+      , path: .Path
+      , created_on: .CreatedOn | timestamp
+      }
+    , lnk: (.Lnk | lnk)
     }
-  , lnk: (.Lnk | lnk)
-  }
 ;
 
 def transform:
-  . as $x |
-  ( if .data.Entries
-    then custom_destinations
-    else automatic_destinations
-    end
-  ) |
-  ., (. | lecmd::lnk_events) |
-  .log.file.path |= $x.path
+  . as $x
+  | ( if .data.Entries
+      then custom_destinations
+      else automatic_destinations
+      end
+    )
+  | ., (. | lecmd::lnk_events)
+  | .log.file.path |= $x.path
 ;

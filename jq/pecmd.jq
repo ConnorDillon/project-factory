@@ -29,24 +29,23 @@ def transform:
     { path: .path
     , mime_type: .type
     }
-  } as $pf |
-
-  .
-  , ( $pf.prefetch.runs[] |
-      { "@timestamp": .
-      , event:
-        { kind: "event"
-        , category: "process"
-        , type: "start"
-        , action: "process-start"
-        , outcome: "success"
-        }
-      , log: {file: {path: $pf.file.path}}
-      , file: {name: $pf.prefetch.executable_name}
-      , process:
-        { name: $pf.prefetch.executable_name
-        , start: .
-        }
-      }
-    )
+  } as $pf
+  | $pf 
+    , ( $pf.prefetch.runs[]
+        | { "@timestamp": .
+          , event:
+            { kind: "event"
+            , category: "process"
+            , type: "start"
+            , action: "process-start"
+            , outcome: "success"
+            }
+          , log: {file: {path: $pf.file.path}}
+          , file: {name: $pf.prefetch.executable_name}
+          , process:
+            { name: $pf.prefetch.executable_name
+            , start: .
+            }
+          }
+      )
 ;

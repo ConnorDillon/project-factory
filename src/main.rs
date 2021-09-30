@@ -82,12 +82,6 @@ where
 fn set_opts() -> Options {
     let mut opts = Options::new();
     opts.optflag("h", "help", "Show this help information.");
-    opts.optopt(
-        "y",
-        "yara",
-        "Path to the yara rules file (required)",
-        "PATH",
-    );
     opts.optopt("c", "config", "Path to the config file (required)", "PATH");
     opts.optopt(
         "i",

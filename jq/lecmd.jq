@@ -3,27 +3,27 @@ def timestamp:
 ;
 
 def lnk_events:
-  . as $lnk |
-  { file:
-    { type:
-      ( try (if .lnk.file_attributes | test("FileAttributeDirectory") then "dir" else "file" end)
-        catch null
-      )
-    , path: .lnk.local_path
-    , size: .lnk.file_size
-    }
-  , log: {file: {path: .file.path}}
-  , event:
-    { kind: "event"
-    , category: "file"
-    , outcome: "success"
-    }
-  } |
-  ( . * {"@timestamp": $lnk.lnk.target_created, event: {type: "creation", action: "file-created"}}
-  , . * {"@timestamp": $lnk.lnk.target_modified, event: {type: "change", action: "file-modified"}}
-  , . * {"@timestamp": $lnk.lnk.target_accessed, event: {type: "access", action: "file-accessed"}}
-  ) |
-  select(.["@timestamp"])
+  . as $lnk 
+  | { file:
+      { type:
+        ( try (if .lnk.file_attributes | test("FileAttributeDirectory") then "dir" else "file" end)
+          catch null
+        )
+      , path: .lnk.local_path
+      , size: .lnk.file_size
+      }
+    , log: {file: {path: .file.path}}
+    , event:
+      { kind: "event"
+      , category: "file"
+      , outcome: "success"
+      }
+    } 
+  | ( . * {"@timestamp": $lnk.lnk.target_created, event: {type: "creation", action: "file-created"}}
+    , . * {"@timestamp": $lnk.lnk.target_modified, event: {type: "change", action: "file-modified"}}
+    , . * {"@timestamp": $lnk.lnk.target_accessed, event: {type: "access", action: "file-accessed"}}
+    ) 
+  | select(.["@timestamp"])
 ;
 
 def transform:
@@ -52,6 +52,6 @@ def transform:
     , target_path: .data.LocalPath
     , type: "symlink"
     }
-  } |
-  ., (. | lnk_events)
+  }
+  | ., (. | lnk_events)
 ;
